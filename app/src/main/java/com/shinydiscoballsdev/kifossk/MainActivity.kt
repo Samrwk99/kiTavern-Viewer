@@ -39,6 +39,10 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.Insets
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -57,6 +61,8 @@ class MainActivity : AppCompatActivity() {
     private var activityResumed = false
     private var activityHasWindowFocus = false
     private var noPageAssetPageFinished = false
+    private var mainFrameLoading = false
+    private var recoveryNavigationPending = false
     private var handingWebViewToRecreatedActivity = false
 
     private val blobDownloader: BlobDownloaderInterface by lazy {
@@ -85,17 +91,20 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         requestPermissionsIfNeeded()
 
+        configureKeyboardInsets()
         container = FrameLayout(this)
         container.setBackgroundColor(Color.parseColor("#1a1a2e"))
         setContentView(container)
+        installKeyboardInsetsListener()
 
         // A restored settings overlay must be rebound to this Activity instance.
         settingsFragment = supportFragmentManager.findFragmentByTag(SETTINGS_TAG) as? SettingsFragment
         settingsFragment?.let(::bindSettingsCallbacks)
 
         noPagePinger = NoPagePinger(
-            targetUrlProvider = { KioskPrefs.getUrl(this@MainActivity) },
-            shouldPing = { shouldPingNoPageTarget() }
+            targetUrlProvider = { currentNoPageRetryUrl() },
+            shouldPing = { shouldPingNoPageTarget() },
+            onSuccessfulPing = { target -> recoverFromNoPageIfIdle(target) }
         )
 
         setupWebView(savedInstanceState)
@@ -115,6 +124,50 @@ class MainActivity : AppCompatActivity() {
     private fun applyTheme() {
         val theme = KioskPrefs.getTheme(this)
         setTheme(if (theme == "light") R.style.Theme_KioskViewer_Light else R.style.Theme_KioskViewer)
+    }
+
+    /**
+     * Resize the content for the IME rather than reasserting fullscreen flags on
+     * window focus changes (Gboard can temporarily create its own popup window).
+     * The manifest should also declare adjustResize for pre-Android 11 devices.
+     */
+    private fun configureKeyboardInsets() {
+        @Suppress("DEPRECATION")
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        // We handle the content root's IME and system bar insets once, rather
+        // than repeatedly hiding system bars whenever Gboard changes focus.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+    }
+
+    private fun installKeyboardInsetsListener() {
+        // Both the WebView and the swipeable Settings overlay are children of
+        // android.R.id.content. Apply padding here so neither sits behind Gboard.
+        val root = findViewById<FrameLayout>(android.R.id.content)
+        val handledTypes = WindowInsetsCompat.Type.ime() or
+            WindowInsetsCompat.Type.systemBars() or
+            WindowInsetsCompat.Type.displayCutout()
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            val imeBottom = if (insets.isVisible(WindowInsetsCompat.Type.ime())) {
+                insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            } else {
+                0
+            }
+            val bottom = maxOf(bars.bottom, imeBottom)
+            if (view.paddingLeft != bars.left || view.paddingTop != bars.top ||
+                view.paddingRight != bars.right || view.paddingBottom != bottom
+            ) {
+                view.setPadding(bars.left, bars.top, bars.right, bottom)
+            }
+            // The native parent has already applied these insets. Zero only
+            // these types for children, avoiding WebView's double IME padding.
+            WindowInsetsCompat.Builder(insets)
+                .setInsets(handledTypes, Insets.NONE)
+                .build()
+        }
+        ViewCompat.requestApplyInsets(root)
     }
 
     /** Applies runtime preferences without navigating/reloading the WebView. */
@@ -172,8 +225,9 @@ class MainActivity : AppCompatActivity() {
         // If this is a configuration/recreation hand-off, keep the same WebView object
         // and its live DOM/JS heap. An explicit EXTRA_RELOAD still overrides retention.
         if (retainedWebView != null) {
-            noPageAssetPageFinished = !forceReload &&
-                retainedWebView.progress >= 100 && isNoPageAssetUrl(retainedWebView.url)
+            mainFrameLoading = retainedWebView.progress < 100
+            noPageAssetPageFinished = !forceReload && !mainFrameLoading &&
+                isNoPageAssetUrl(retainedWebView.url)
             if (forceReload) webView.loadUrl(KioskPrefs.getUrl(this))
             intent?.removeExtra(EXTRA_RELOAD)
             updateNoPagePinger()
@@ -202,6 +256,15 @@ class MainActivity : AppCompatActivity() {
                 webView.loadUrl(savedUrl ?: KioskPrefs.getUrl(this))
             }
             else -> Log.d(TAG, "Restored WebView back/forward state at ${webView.url}")
+        }
+
+        // Restoring history may not produce another onPageFinished() callback.
+        // Resume checking if the local fallback is already fully displayed.
+        if (!forceReload && restoredHistory != null &&
+            isNoPageAssetUrl(webView.url) && webView.progress >= 100
+        ) {
+            mainFrameLoading = false
+            noPageAssetPageFinished = true
         }
 
         // Do not let a one-shot explicit reload extra cause another reload on recreation.
@@ -258,7 +321,9 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                // Do not begin probing until the local error page has finished loading.
+                // Only ping when the local fallback has fully loaded and is idle.
+                mainFrameLoading = true
+                recoveryNavigationPending = false
                 noPageAssetPageFinished = false
                 updateNoPagePinger()
             }
@@ -266,6 +331,8 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 if (view != null) injectBlobInterceptor(view)
+                mainFrameLoading = false
+                recoveryNavigationPending = false
                 noPageAssetPageFinished = isNoPageAssetUrl(url ?: view?.url)
                 updateNoPagePinger()
             }
@@ -296,6 +363,15 @@ class MainActivity : AppCompatActivity() {
         }
 
         view.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                // onPageFinished can run before WebView reaches 100% progress.
+                // Start recovery probes once both signals say the page is idle.
+                if (newProgress == 100 && noPageAssetPageFinished && !mainFrameLoading) {
+                    updateNoPagePinger()
+                }
+            }
+
             override fun onShowFileChooser(
                 webView: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
@@ -389,6 +465,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun recoverWebViewAfterRendererExit(deadWebView: WebView) {
         noPageAssetPageFinished = false
+        mainFrameLoading = false
+        recoveryNavigationPending = false
         val urlToRestore = deadWebView.url
             ?.takeIf { UrlValidator.isValid(it) || isNoPageAssetUrl(it) }
             ?: KioskPrefs.getUrl(this)
@@ -549,6 +627,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * The fallback page records the URL that actually failed, which may be a
+     * SillyTavern deep link rather than the configured homepage. Retry that URL
+     * when possible; do not navigate back to the local error asset.
+     * This provider is called only on the main thread by NoPagePinger.
+     */
+    private fun currentNoPageRetryUrl(): String {
+        val configuredUrl = KioskPrefs.getUrl(this)
+        if (!::webView.isInitialized || !isNoPageAssetUrl(webView.url)) return configuredUrl
+        return try {
+            Uri.parse(webView.url).getQueryParameter("url")
+                ?.takeIf { UrlValidator.isValid(it) }
+                ?: configuredUrl
+        } catch (_: Exception) {
+            configuredUrl
+        }
+    }
+
     private fun shouldPingNoPageTarget(): Boolean {
         return activityResumed &&
             activityHasWindowFocus &&
@@ -556,9 +652,33 @@ class MainActivity : AppCompatActivity() {
             !isFinishing &&
             !isDestroyed &&
             noPageAssetPageFinished &&
+            !mainFrameLoading &&
+            !recoveryNavigationPending &&
             ::webView.isInitialized &&
             webView.isAttachedToWindow &&
+            webView.progress >= 100 &&
             isNoPageAssetUrl(webView.url)
+    }
+
+    /** Runs on the UI thread, after an HTTP 2xx/3xx ping finishes. */
+    private fun recoverFromNoPageIfIdle(successfulTarget: String) {
+        // The fallback URL or configured URL may have changed during the ping.
+        // Recheck state after the network callback to prevent stale navigation.
+        if (!shouldPingNoPageTarget() || successfulTarget != currentNoPageRetryUrl()) return
+
+        recoveryNavigationPending = true // close the race before issuing loadUrl()
+        noPageAssetPageFinished = false
+        updateNoPagePinger() // cancels the ticker and invalidates queued callbacks
+        try {
+            Log.i(TAG, "Fallback page online again; retrying original website URL")
+            webView.loadUrl(successfulTarget) // never reload the local nopage.html asset
+        } catch (e: Exception) {
+            recoveryNavigationPending = false
+            noPageAssetPageFinished = isNoPageAssetUrl(webView.url) &&
+                webView.progress >= 100 && !mainFrameLoading
+            updateNoPagePinger()
+            Log.e(TAG, "Failed to start recovery navigation", e)
+        }
     }
 
     private fun updateNoPagePinger() {

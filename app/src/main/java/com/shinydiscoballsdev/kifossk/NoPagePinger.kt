@@ -8,7 +8,6 @@ import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Makes a lightweight HTTP HEAD request to the configured target about once a
@@ -17,7 +16,8 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class NoPagePinger(
     private val targetUrlProvider: () -> String,
-    private val shouldPing: () -> Boolean
+    private val shouldPing: () -> Boolean,
+    private val onSuccessfulPing: (String) -> Unit
 ) : AutoCloseable {
 
     companion object {
@@ -33,7 +33,6 @@ class NoPagePinger(
     }
     private val inFlight = AtomicBoolean(false)
     private val generation = AtomicInteger(0)
-    private val activeConnection = AtomicReference<HttpURLConnection?>(null)
 
     @Volatile
     private var running = false
@@ -81,7 +80,10 @@ class NoPagePinger(
         running = false
         generation.incrementAndGet()
         mainHandler.removeCallbacks(ticker)
-        activeConnection.getAndSet(null)?.disconnect()
+        // Do not disconnect a network socket on the UI thread: some Android
+        // implementations can block in disconnect(). The in-flight request has
+        // short timeouts and finally closes its own connection; generation
+        // invalidation prevents any callback from an old request.
     }
 
     private fun performPing(target: String, runId: Int) {
@@ -91,7 +93,6 @@ class NoPagePinger(
             val parsedUrl = URL(target)
             val headConnection = parsedUrl.openConnection() as? HttpURLConnection ?: return
             connection = headConnection
-            activeConnection.set(headConnection)
             if (!isCurrentRun(runId)) return
 
             headConnection.instanceFollowRedirects = true
@@ -102,16 +103,15 @@ class NoPagePinger(
             headConnection.setRequestProperty("Cache-Control", "no-cache, no-store")
             headConnection.setRequestProperty("Pragma", "no-cache")
             val status = headConnection.responseCode
+            var finalStatus = status
 
             // Some servers do not implement HEAD. Fall back to a tiny GET in that case.
             if ((status == HttpURLConnection.HTTP_BAD_METHOD || status == HttpURLConnection.HTTP_NOT_IMPLEMENTED) &&
                 isCurrentRun(runId)
             ) {
-                activeConnection.compareAndSet(headConnection, null)
                 headConnection.disconnect()
                 val getConnection = parsedUrl.openConnection() as? HttpURLConnection ?: return
                 connection = getConnection
-                activeConnection.set(getConnection)
                 if (!isCurrentRun(runId)) return
                 getConnection.requestMethod = "GET"
                 getConnection.connectTimeout = CONNECT_TIMEOUT_MS
@@ -119,12 +119,17 @@ class NoPagePinger(
                 getConnection.useCaches = false
                 getConnection.setRequestProperty("Range", "bytes=0-0")
                 getConnection.setRequestProperty("Cache-Control", "no-cache, no-store")
-                getConnection.responseCode
-                try {
-                    getConnection.inputStream.use { it.read() }
-                } catch (_: Exception) {
-                    // An HTTP error response still means the endpoint answered the request.
-                    try { getConnection.errorStream?.use { it.read() } } catch (_: Exception) {}
+                finalStatus = getConnection.responseCode
+                // Don't download the entire fallback GET body; we only need its status.
+            }
+
+            // A responding HTTP error page (401/404/500) is NOT recovery.
+            if (finalStatus in 200..399 && isCurrentRun(runId)) {
+                mainHandler.post {
+                    // Network callbacks can arrive after focus, URL or Activity changes.
+                    if (isCurrentRun(runId) && shouldPing()) {
+                        onSuccessfulPing(target)
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -132,7 +137,6 @@ class NoPagePinger(
             Log.d(TAG, "Target ping failed: ${e.message}")
         } finally {
             if (connection != null) {
-                activeConnection.compareAndSet(connection, null)
                 connection.disconnect()
             }
         }
