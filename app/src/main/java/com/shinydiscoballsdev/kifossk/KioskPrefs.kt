@@ -60,6 +60,43 @@ object KioskPrefs {
         getInstance(context).edit().putString("app_theme", safe).apply()
     }
 
+    /** Store a settings snapshot with one apply() instead of several disk writes. */
+    fun saveSettings(
+        context: Context,
+        url: String,
+        screenOn: Boolean,
+        keepAlive: Boolean,
+        showNotification: Boolean,
+        orientation: String,
+        theme: String
+    ) {
+        val prefs = getInstance(context)
+        val safeOrientation = orientation.takeIf { it in setOf("landscape", "portrait", "auto") } ?: "auto"
+        val safeTheme = theme.takeIf { it == "dark" || it == "light" } ?: "dark"
+        val editor = prefs.edit()
+        var changed = false
+
+        fun putString(key: String, value: String) {
+            if (prefs.getString(key, null) != value) {
+                editor.putString(key, value)
+                changed = true
+            }
+        }
+        fun putBoolean(key: String, value: Boolean, default: Boolean) {
+            if (prefs.getBoolean(key, default) != value) {
+                editor.putBoolean(key, value)
+                changed = true
+            }
+        }
+        putString("web_url", url.trim())
+        putBoolean("screen_on", screenOn, false)
+        putBoolean("keep_alive", keepAlive, true)
+        putBoolean("show_notification", showNotification, true)
+        putString("orientation", safeOrientation)
+        putString("app_theme", safeTheme)
+        if (changed) editor.apply()
+    }
+
     /** Controls whether the ongoing notification includes descriptive text; it cannot remove an FGS notification. */
     fun getKeepAlive(context: Context): Boolean =
         getInstance(context).getBoolean("keep_alive", true)

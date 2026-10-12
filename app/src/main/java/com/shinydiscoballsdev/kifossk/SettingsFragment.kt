@@ -121,7 +121,8 @@ class SettingsFragment : Fragment() {
                 if (selectedTheme != KioskPrefs.getTheme(ctx)) {
                     // Save every field before Activity recreation; WebView state is restored by MainActivity.
                     saveSettings(notifyActivity = false)
-                    KioskPrefs.setTheme(ctx, selectedTheme)
+                    // Full native theme resources still require Activity recreation.
+                    // MainActivity retains and rebinds the live WebView across it.
                     activity?.recreate()
                 }
             }
@@ -269,21 +270,24 @@ class SettingsFragment : Fragment() {
 
     private fun saveSettings(notifyActivity: Boolean = true) {
         val ctx = context ?: return
-        KioskPrefs.setUrl(ctx, editTextUrl.text.toString())
-        KioskPrefs.setScreenOn(ctx, switchScreenOn.isChecked)
-
         val previousKeepAlive = KioskPrefs.getKeepAlive(ctx)
         val desiredKeepAlive = switchKeepAlive.isChecked
-        KioskPrefs.setKeepAlive(ctx, desiredKeepAlive)
+        val orientationMap = mapOf(0 to "landscape", 1 to "portrait", 2 to "auto")
+        val themeMap = mapOf(0 to "dark", 1 to "light")
+        KioskPrefs.saveSettings(
+            ctx,
+            editTextUrl.text.toString(),
+            switchScreenOn.isChecked,
+            desiredKeepAlive,
+            switchShowNotification.isChecked,
+            orientationMap[spinnerOrientation.selectedItemPosition] ?: "auto",
+            themeMap[spinnerTheme.selectedItemPosition] ?: "dark"
+        )
+        // The switch still takes effect immediately. Saving the other fields
+        // must not cause an unnecessary restart of the service.
         if (desiredKeepAlive != previousKeepAlive) {
             if (desiredKeepAlive) KeepAliveService.start(ctx) else KeepAliveService.stop(ctx)
         }
-        KioskPrefs.setShowNotification(ctx, switchShowNotification.isChecked)
-
-        val orientationMap = mapOf(0 to "landscape", 1 to "portrait", 2 to "auto")
-        KioskPrefs.setOrientation(ctx, orientationMap[spinnerOrientation.selectedItemPosition] ?: "auto")
-        val themeMap = mapOf(0 to "dark", 1 to "light")
-        KioskPrefs.setTheme(ctx, themeMap[spinnerTheme.selectedItemPosition] ?: "dark")
 
         if (notifyActivity) onSettingsChanged?.invoke()
         updateBatteryStatus(ctx)
