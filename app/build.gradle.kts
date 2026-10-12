@@ -35,9 +35,8 @@ android {
             storeFile = file("../kiFOSSk-new.keystore")
 
             val localProps = Properties()
-            rootProject.file("local.properties").inputStream().use { input ->
-                localProps.load(input)
-            }
+            rootProject.file("local.properties").takeIf { it.exists() }
+                ?.inputStream()?.use { input -> localProps.load(input) }
 
             storePassword = localProps.getProperty("kifossk_key.storePassword", "")
             keyAlias = localProps.getProperty("kifossk_key.keyAlias", "kifoss_key")
@@ -47,7 +46,9 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // Shrink and optimize only release builds; debug builds remain easy to inspect.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -68,5 +69,4 @@ android {
 
 dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("androidx.webkit:webkit:1.9.0")
 }
