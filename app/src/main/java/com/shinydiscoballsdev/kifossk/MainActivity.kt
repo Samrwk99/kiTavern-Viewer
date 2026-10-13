@@ -266,13 +266,32 @@ class MainActivity : AppCompatActivity() {
                 var hiddenPx = 0;
                 var viewHeightPx = 0;
                 var adjustedElement = null;
+                var adjustedScrollbar = null;
+                var adjustedShell = null;
+                var originalShellHeight = '';
+                var originalShellMaxHeight = '';
+                var naturalShellHeight = 0;
                 var originalTranslate = '';
                 var lastLift = 0;
                 var scheduled = false;
+                var composerResizeObserver = window.ResizeObserver ?
+                    new ResizeObserver(schedule) : null;
 
                 function reset() {
-                    if (adjustedElement) adjustedElement.style.translate = originalTranslate;
+                    if (adjustedElement) {
+                        adjustedElement.style.translate = originalTranslate;
+                        if (composerResizeObserver) composerResizeObserver.unobserve(adjustedElement);
+                    }
+                    if (adjustedScrollbar) {
+                        adjustedScrollbar.style.removeProperty('--kiTavernScrollbarBottomSpace');
+                    }
+                    if (adjustedShell) {
+                        adjustedShell.style.height = originalShellHeight;
+                        adjustedShell.style.maxHeight = originalShellMaxHeight;
+                    }
                     adjustedElement = null;
+                    adjustedScrollbar = null;
+                    adjustedShell = null;
                     originalTranslate = '';
                     lastLift = 0;
                 }
@@ -290,12 +309,6 @@ class MainActivity : AppCompatActivity() {
                         return;
                     }
 
-                    if (adjustedElement !== bar) {
-                        reset();
-                        adjustedElement = bar;
-                        originalTranslate = bar.style.translate || '';
-                    }
-
                     // Convert measured Android screen pixels to page CSS pixels.
                     // Using the actual WebView height accounts for the page's scale.
                     var pageHeight = window.innerHeight;
@@ -307,6 +320,40 @@ class MainActivity : AppCompatActivity() {
                     }
                     usableBottom -= 10; // small gap above the keyboard
 
+                    // SillyTavern's chat and composer are flex children of #sheld.
+                    // Shrinking their parent makes BOTH fit above the keyboard,
+                    // instead of moving only the composer and scrollbar thumb.
+                    var chat = document.getElementById('chat');
+                    var shell = document.getElementById('sheld');
+                    if (chat && shell && shell.contains(chat) && shell.contains(bar)) {
+                        if (adjustedShell !== shell) {
+                            reset();
+                            adjustedShell = shell;
+                            originalShellHeight = shell.style.height;
+                            originalShellMaxHeight = shell.style.maxHeight;
+                            naturalShellHeight = shell.getBoundingClientRect().height;
+                        }
+                        var availableHeight = Math.max(100, Math.floor(
+                            usableBottom - shell.getBoundingClientRect().top));
+                        var nextHeight = Math.min(naturalShellHeight, availableHeight) + 'px';
+                        if (shell.style.height !== nextHeight || shell.style.maxHeight !== nextHeight) {
+                            var atBottom = chat.scrollHeight - chat.clientHeight - chat.scrollTop < 32;
+                            shell.style.height = nextHeight;
+                            shell.style.maxHeight = nextHeight;
+                            if (atBottom) chat.scrollTop = chat.scrollHeight;
+                        }
+                        return;
+                    }
+                    if (adjustedShell) reset();
+
+                    // Fallback for pages without SillyTavern's flex chat container.
+                    if (adjustedElement !== bar) {
+                        reset();
+                        adjustedElement = bar;
+                        originalTranslate = bar.style.translate || '';
+                        if (composerResizeObserver) composerResizeObserver.observe(bar);
+                    }
+
                     // getBoundingClientRect includes our previous lift. Add it back
                     // before computing the next lift so repeated events don't drift.
                     var naturalBottom = bar.getBoundingClientRect().bottom + lastLift;
@@ -315,6 +362,22 @@ class MainActivity : AppCompatActivity() {
                     if (lift !== lastLift) {
                         lastLift = lift;
                         bar.style.translate = lift > 0 ? ('0px -' + lift + 'px') : originalTranslate;
+                    }
+
+                    // The keyboard overlays the WebView, so the chat's scrollbar
+                    // still extends behind it and behind the lifted composer.
+                    // Shorten only the scrollbar track, not the chat layout.
+                    if (adjustedScrollbar && adjustedScrollbar !== chat) {
+                        adjustedScrollbar.style.removeProperty('--kiTavernScrollbarBottomSpace');
+                    }
+                    adjustedScrollbar = chat;
+                    if (chat) {
+                        var chatRect = chat.getBoundingClientRect();
+                        var visibleBottom = Math.min(usableBottom,
+                            bar.getBoundingClientRect().top - 4);
+                        var blocked = Math.max(0, Math.min(chatRect.height - 24,
+                            Math.ceil(chatRect.bottom - visibleBottom)));
+                        chat.style.setProperty('--kiTavernScrollbarBottomSpace', blocked + 'px');
                     }
                 }
 
@@ -891,7 +954,18 @@ class MainActivity : AppCompatActivity() {
                 var active = null;
                 // Keep the chosen visible width separate from the larger touch target.
                 var style = document.createElement('style');
-                style.textContent = '::-webkit-scrollbar { width: 12px; }';
+                style.textContent =
+                    '::-webkit-scrollbar { width: 12px; }' +
+                    // Reserve the part of the chat scrollbar hidden by the
+                    // keyboard/lifted composer as a transparent bottom button.
+                    // This moves the native thumb's travel range above both.
+                    '#chat::-webkit-scrollbar-button:vertical:end:increment {' +
+                    'display: block !important;' +
+                    'height: var(--kiTavernScrollbarBottomSpace, 0px) !important;' +
+                    'background: transparent !important;' +
+                    'border: 0 !important;' +
+                    'box-shadow: none !important;' +
+                    '}';
                 (document.head || document.documentElement).appendChild(style);
 
                 // Change only the thumb colour when pressed. Preserve its existing
@@ -944,8 +1018,12 @@ class MainActivity : AppCompatActivity() {
                             var bar = getComputedStyle(el, '::-webkit-scrollbar');
                             var barWidth = parseFloat(bar.width) ||
                                 (style.scrollbarWidth === 'thin' ? 10 : 16);
+                            var blocked = el.id === 'chat' ?
+                                (parseFloat(style.getPropertyValue('--kiTavernScrollbarBottomSpace')) || 0) : 0;
+                            if (y > rect.bottom - blocked) continue;
                             if (x >= rect.right - Math.max(grabZoneWidth, barWidth + 4)) {
-                                return {el: el, top: rect.top, height: rect.height};
+                                return {el: el, top: rect.top,
+                                    height: Math.max(1, rect.height - blocked)};
                             }
                         }
                     }
