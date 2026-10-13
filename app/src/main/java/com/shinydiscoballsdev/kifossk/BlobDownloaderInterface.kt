@@ -8,7 +8,6 @@ import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Base64
 import android.util.Log
@@ -18,35 +17,16 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
 import java.util.UUID
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
 
 /**
- * Chunked download bridge. A per-page capability prevents unrelated iframes
- * from starting downloads through Android's frame-global JavaScript interface.
- * Chunk tokens are individually unguessable. Files are written sequentially,
- * retaining the same paths and MediaStore behavior as the previous version.
+ * Small, sequential, chunked bridge for WebView Blob downloads. It avoids
+ * holding a complete downloaded Blob in an Android byte array/Base64 string.
+ * JS calls are made on a private WebView thread; all mutable state is guarded.
  */
 class BlobDownloaderInterface(context: Context) {
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
     private val transfers = HashMap<String, Transfer>()
-    private var currentPageCapability: String? = null
-    private var sweepScheduled = false
-    private var generation = 0
-
-    // Data URLs arrive from WebView callbacks on the UI thread. Bounded, lazy
-    // worker threads avoid blocking input and bound queued encoded payloads.
-    private val dataUrlWorker by lazy {
-        ThreadPoolExecutor(
-            1, 1, 0L, TimeUnit.MILLISECONDS,
-            ArrayBlockingQueue<Runnable>(4),
-            { job -> Thread(job, "KiTavernDataDownloads").apply { isDaemon = true } },
-            ThreadPoolExecutor.AbortPolicy()
-        )
-    }
 
     private data class Transfer(
         val stream: OutputStream,
@@ -54,7 +34,7 @@ class BlobDownloaderInterface(context: Context) {
         val mimeType: String,
         val mediaUri: Uri?,
         val file: File?,
-        var lastActivityMs: Long = SystemClock.elapsedRealtime()
+        var lastActivityMs: Long = System.currentTimeMillis()
     )
 
     companion object {
@@ -62,36 +42,12 @@ class BlobDownloaderInterface(context: Context) {
         private const val MAX_TRANSFERS = 3
         private const val MAX_ENCODED_CHUNK_LENGTH = 512 * 1024
         private const val STALE_TRANSFER_MS = 15 * 60 * 1000L
-        private const val SWEEP_INTERVAL_MS = 60 * 1000L
     }
 
-    /** Called only on the UI thread while installing a top-level document script. */
-    @Synchronized
-    fun newPageCapability(): String = UUID.randomUUID().toString().also {
-        currentPageCapability = it
-    }
-
-    @Synchronized
-    fun invalidatePageCapability() {
-        currentPageCapability = null
-    }
-
-    /**
-     * Android injects @JavascriptInterface into every frame, but only the
-     * top-level document receives the capability in its private JS closure.
-     */
+    /** Begin a download. Return an opaque token, or an empty string on failure. */
     @JavascriptInterface
     @Synchronized
-    fun beginDownload(pageCapability: String, mimeType: String, filename: String): String {
-        if (pageCapability != currentPageCapability || currentPageCapability == null) {
-            Log.w(TAG, "Rejected Blob download without main-page authorization")
-            return ""
-        }
-        return beginDownloadNative(mimeType, filename)
-    }
-
-    @Synchronized
-    private fun beginDownloadNative(mimeType: String, filename: String): String {
+    fun beginDownload(mimeType: String, filename: String): String {
         cleanStaleTransfers()
         if (transfers.size >= MAX_TRANSFERS) {
             Log.w(TAG, "Too many simultaneous Blob transfers")
@@ -132,7 +88,6 @@ class BlobDownloaderInterface(context: Context) {
             }
             val token = UUID.randomUUID().toString()
             transfers[token] = Transfer(stream, safeFilename, safeMime, mediaUri, file)
-            scheduleStaleSweep()
             token
         } catch (e: Exception) {
             Log.e(TAG, "Unable to begin Blob download", e)
@@ -154,7 +109,7 @@ class BlobDownloaderInterface(context: Context) {
         }
         return try {
             transfer.stream.write(Base64.decode(base64Chunk, Base64.DEFAULT))
-            transfer.lastActivityMs = SystemClock.elapsedRealtime()
+            transfer.lastActivityMs = System.currentTimeMillis()
             true
         } catch (e: Exception) {
             Log.e(TAG, "Blob chunk write failed", e)
@@ -167,7 +122,6 @@ class BlobDownloaderInterface(context: Context) {
     @Synchronized
     fun finishDownload(token: String) {
         val transfer = transfers.remove(token) ?: return
-        rescheduleOrStopStaleSweep()
         try {
             transfer.stream.close()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && transfer.mediaUri != null) {
@@ -193,63 +147,23 @@ class BlobDownloaderInterface(context: Context) {
     @Synchronized
     fun cancelDownload(token: String) {
         transfers.remove(token)?.let(::removeIncomplete)
-        rescheduleOrStopStaleSweep()
     }
 
-    /** Stop transfers from a dead renderer; doesn't shut down future downloads. */
+    /** Called when the owning WebView is permanently destroyed, not on rotation. */
     @Synchronized
     fun cancelAllDownloads() {
-        generation++
         transfers.keys.toList().forEach(::cancelDownload)
     }
 
-    /** Called only when the owner WebView is permanently destroyed. */
-    fun close() {
-        invalidatePageCapability()
-        cancelAllDownloads()
-        if (dataUrlWorkerInitialized()) dataUrlWorker.shutdownNow()
-    }
-
-    // Do not instantiate the thread pool just to shut down an unused bridge.
-    private var workerUsed = false
-    private fun dataUrlWorkerInitialized(): Boolean = workerUsed
-
-    fun downloadDataUrlAsync(payload: String, mimeType: String, filename: String, isBase64: Boolean) {
-        val expectedGeneration = synchronized(this) { generation }
-        try {
-            workerUsed = true
-            dataUrlWorker.execute {
-                if (synchronized(this) { generation != expectedGeneration }) return@execute
-                try {
-                    if (isBase64) {
-                        downloadBase64(payload, mimeType, filename, expectedGeneration)
-                    } else {
-                        downloadText(Uri.decode(payload), mimeType, filename, expectedGeneration)
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Unable to process data URL", e)
-                    showToast("Download failed")
-                }
-            }
-        } catch (e: RejectedExecutionException) {
-            Log.w(TAG, "Data URL download worker is busy", e)
-            showToast("Unable to start download")
-        }
-    }
-
-    private fun downloadBase64(
-        base64Data: String, mimeType: String, filename: String, expectedGeneration: Int
-    ) {
-        val token = beginDownloadNative(mimeType, filename)
+    // Support data: URLs without allocating a second full encoded or decoded copy.
+    @JavascriptInterface
+    fun downloadBase64(base64Data: String, mimeType: String, filename: String) {
+        val token = beginDownload(mimeType, filename)
         if (token.isEmpty()) return
         try {
             // 256 KiB is divisible by four, so individual Base64 blocks decode safely.
             var index = 0
             while (index < base64Data.length) {
-                if (synchronized(this) { generation != expectedGeneration }) {
-                    cancelDownload(token)
-                    return
-                }
                 val end = (index + 256 * 1024).coerceAtMost(base64Data.length)
                 if (!appendChunk(token, base64Data.substring(index, end))) return
                 index = end
@@ -261,23 +175,15 @@ class BlobDownloaderInterface(context: Context) {
         }
     }
 
-    private fun downloadText(
-        text: String, mimeType: String, filename: String, expectedGeneration: Int
-    ) {
-        if (synchronized(this) { generation != expectedGeneration }) return
-        val token = beginDownloadNative(mimeType, filename)
+    fun downloadText(text: String, mimeType: String, filename: String) {
+        val token = beginDownload(mimeType, filename)
         if (token.isEmpty()) return
         try {
+            // On this path data: payloads are usually tiny strings; don't round-trip
+            // them through Base64 just to pass them back into Kotlin.
             val bytes = text.toByteArray(Charsets.UTF_8)
-            synchronized(this) {
-                if (generation != expectedGeneration) {
-                    cancelDownload(token)
-                    return
-                }
-                val transfer = transfers[token] ?: return
-                transfer.stream.write(bytes)
-                transfer.lastActivityMs = SystemClock.elapsedRealtime()
-            }
+            val transfer = synchronized(this) { transfers[token] } ?: return
+            synchronized(this) { transfer.stream.write(bytes) }
             finishDownload(token)
         } catch (e: Exception) {
             cancelDownload(token)
@@ -291,41 +197,10 @@ class BlobDownloaderInterface(context: Context) {
         transfer.file?.let { runCatching { it.delete() } }
     }
 
-    private val staleSweep = object : Runnable {
-        override fun run() {
-            synchronized(this@BlobDownloaderInterface) {
-                sweepScheduled = false
-                cleanStaleTransfers()
-                scheduleStaleSweep()
-            }
-        }
-    }
-
-    @Synchronized
-    private fun scheduleStaleSweep() {
-        if (transfers.isNotEmpty() && !sweepScheduled) {
-            sweepScheduled = true
-            mainHandler.postDelayed(staleSweep, SWEEP_INTERVAL_MS)
-        }
-    }
-
-    @Synchronized
-    private fun rescheduleOrStopStaleSweep() {
-        if (transfers.isEmpty() && sweepScheduled) {
-            mainHandler.removeCallbacks(staleSweep)
-            sweepScheduled = false
-        }
-    }
-
-    @Synchronized
     private fun cleanStaleTransfers() {
-        val now = SystemClock.elapsedRealtime()
-        val stale = transfers.filterValues { now - it.lastActivityMs > STALE_TRANSFER_MS }
-            .keys.toList()
-        stale.forEach { token ->
-            Log.w(TAG, "Cancelling inactive Blob transfer")
-            cancelDownload(token)
-        }
+        val now = System.currentTimeMillis()
+        val stale = transfers.filterValues { now - it.lastActivityMs > STALE_TRANSFER_MS }.keys.toList()
+        stale.forEach { cancelDownload(it) }
     }
 
     private fun showToast(message: String) {
