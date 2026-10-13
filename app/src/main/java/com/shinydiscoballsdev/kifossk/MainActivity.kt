@@ -887,6 +887,38 @@ class MainActivity : AppCompatActivity() {
                 window.__kiTavernScrollbarDragInstalled = true;
 
                 var active = null;
+                // Keep the chosen visible width separate from the larger touch target.
+                var style = document.createElement('style');
+                style.textContent = '::-webkit-scrollbar { width: 12px; }';
+                (document.head || document.documentElement).appendChild(style);
+
+                // Highlight only the scrollbar being dragged. The class is removed
+                // on release/cancellation, returning the site's usual thumb style.
+                var pressedClass = '__kiTavernScrollbarPressed';
+                var pressedStyle = document.createElement('style');
+                pressedStyle.textContent =
+                    '.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb:vertical {' +
+                    'background: rgba(110, 145, 190, 0.95) !important;' +
+                    'box-shadow: inset 0 0 0 1px rgba(255,255,255,0.35) !important;' +
+                    '}';
+                (document.head || document.documentElement).appendChild(pressedStyle);
+
+                // A wider invisible grab zone makes narrow scrollbars easier to touch
+                // without changing their appearance or the webpage layout.
+                var grabZoneWidth = 32;
+
+                function setPressed(el, pressed) {
+                    el.classList.toggle(pressedClass, pressed);
+                    if (el === document.scrollingElement) {
+                        document.documentElement.classList.toggle(pressedClass, pressed);
+                    }
+                }
+
+                function endDrag() {
+                    if (!active) return;
+                    setPressed(active.el, false);
+                    active = null;
+                }
 
                 function findScrollbar(x, y) {
                     // Include scrollable panels, not just the page's main scrollbar.
@@ -903,14 +935,14 @@ class MainActivity : AppCompatActivity() {
                             var bar = getComputedStyle(el, '::-webkit-scrollbar');
                             var barWidth = parseFloat(bar.width) ||
                                 (style.scrollbarWidth === 'thin' ? 10 : 16);
-                            if (x >= rect.right - Math.max(10, barWidth + 4)) {
+                            if (x >= rect.right - Math.max(grabZoneWidth, barWidth + 4)) {
                                 return {el: el, top: rect.top, height: rect.height};
                             }
                         }
                     }
                     var root = document.scrollingElement;
                     if (root && root.scrollHeight > root.clientHeight + 1 &&
-                        x >= innerWidth - 16) {
+                        x >= innerWidth - grabZoneWidth) {
                         return {el: root, top: 0, height: innerHeight};
                     }
                     return null;
@@ -928,6 +960,7 @@ class MainActivity : AppCompatActivity() {
                         id: id, kind: kind, el: el, y: y, start: el.scrollTop,
                         travel: Math.max(1, found.height - thumb), range: range
                     };
+                    setPressed(el, true);
                     return true;
                 }
 
@@ -963,7 +996,7 @@ class MainActivity : AppCompatActivity() {
                     if (!active || active.kind !== 'touch') return;
                     for (var i = 0; i < e.changedTouches.length; i++) {
                         if (e.changedTouches[i].identifier === active.id) {
-                            active = null;
+                            endDrag();
                             break;
                         }
                     }
@@ -987,11 +1020,11 @@ class MainActivity : AppCompatActivity() {
                 }, true);
                 function pointerEnd(e) {
                     if (active && active.kind === 'pointer' && e.pointerId === active.id)
-                        active = null;
+                        endDrag();
                 }
                 document.addEventListener('pointerup', pointerEnd, true);
                 document.addEventListener('pointercancel', pointerEnd, true);
-                window.addEventListener('blur', function() { active = null; });
+                window.addEventListener('blur', endDrag);
             })();
             """.trimIndent(), null
         )
