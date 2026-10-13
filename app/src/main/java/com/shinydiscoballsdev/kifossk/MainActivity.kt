@@ -501,6 +501,8 @@ class MainActivity : AppCompatActivity() {
         val view = existing ?: WebView(MutableContextWrapper(this))
         (view.context as? MutableContextWrapper)?.baseContext = this
         view.setBackgroundColor(Color.parseColor("#1a1a2e"))
+        // Disable Android's overscroll edge glow; the thumb highlight is CSS-only.
+        view.overScrollMode = android.view.View.OVER_SCROLL_NEVER
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             // Keep the renderer at important priority even when this WebView is not visible.
@@ -892,14 +894,21 @@ class MainActivity : AppCompatActivity() {
                 style.textContent = '::-webkit-scrollbar { width: 12px; }';
                 (document.head || document.documentElement).appendChild(style);
 
-                // Highlight only the scrollbar being dragged. The class is removed
-                // on release/cancellation, returning the site's usual thumb style.
+                // Change only the thumb colour when pressed. Preserve its existing
+                // transparent border/shape so it does not appear to get wider.
                 var pressedClass = '__kiTavernScrollbarPressed';
                 var pressedStyle = document.createElement('style');
                 pressedStyle.textContent =
-                    '.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb:vertical {' +
-                    'background: rgba(110, 145, 190, 0.95) !important;' +
-                    'box-shadow: inset 0 0 0 1px rgba(255,255,255,0.35) !important;' +
+                    '.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb {' +
+                    'background-color: #2196F3 !important;' +
+                    'background-clip: padding-box !important;' +
+                    'background-image: none !important;' +
+                    'box-shadow: none !important;' +
+                    '-webkit-box-shadow: none !important;' +
+                    'filter: none !important;' +
+                    '-webkit-filter: none !important;' +
+                    'outline: 0 !important;' +
+                    'transition: none !important;' +
                     '}';
                 (document.head || document.documentElement).appendChild(pressedStyle);
 
