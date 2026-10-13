@@ -439,7 +439,10 @@ class MainActivity : AppCompatActivity() {
             )
         )
         // A retained/restored WebView may never fire onPageFinished again.
-        webView.post { installKeyboardLift(webView) }
+        webView.post {
+            installKeyboardLift(webView)
+            installScrollbarDrag(webView)
+        }
 
         // If this is a configuration/recreation hand-off, keep the same WebView object
         // and its live DOM/JS heap. An explicit EXTRA_RELOAD still overrides retention.
@@ -556,6 +559,7 @@ class MainActivity : AppCompatActivity() {
                 if (view != null) {
                     injectBlobInterceptor(view)
                     installKeyboardLift(view)
+                    installScrollbarDrag(view)
                     installDebugHeartbeat(view)
                 }
                 mainFrameLoading = false
@@ -871,6 +875,126 @@ class MainActivity : AppCompatActivity() {
             })();
         """.trimIndent()
         targetView.evaluateJavascript(js, null)
+    }
+
+    /** Let scrollbar drags continue horizontally away from the scrollbar's narrow track. */
+    private fun installScrollbarDrag(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        target.evaluateJavascript(
+            """
+            (function() {
+                if (window.__kiTavernScrollbarDragInstalled) return;
+                window.__kiTavernScrollbarDragInstalled = true;
+
+                var active = null;
+
+                function findScrollbar(x, y) {
+                    // Include scrollable panels, not just the page's main scrollbar.
+                    var elements = document.elementsFromPoint(x, y);
+                    for (var i = 0; i < elements.length; i++) {
+                        for (var el = elements[i]; el && el.nodeType === 1;
+                             el = el.parentElement) {
+                            if (el === document.body || el === document.documentElement) continue;
+                            var rect = el.getBoundingClientRect();
+                            if (y < rect.top || y > rect.bottom || x > rect.right) continue;
+                            var style = getComputedStyle(el);
+                            if (style.overflowY !== 'auto' && style.overflowY !== 'scroll') continue;
+                            if (el.scrollHeight <= el.clientHeight + 1) continue;
+                            var bar = getComputedStyle(el, '::-webkit-scrollbar');
+                            var barWidth = parseFloat(bar.width) ||
+                                (style.scrollbarWidth === 'thin' ? 10 : 16);
+                            if (x >= rect.right - Math.max(10, barWidth + 4)) {
+                                return {el: el, top: rect.top, height: rect.height};
+                            }
+                        }
+                    }
+                    var root = document.scrollingElement;
+                    if (root && root.scrollHeight > root.clientHeight + 1 &&
+                        x >= innerWidth - 16) {
+                        return {el: root, top: 0, height: innerHeight};
+                    }
+                    return null;
+                }
+
+                function begin(x, y, id, kind) {
+                    if (active) return false;
+                    var found = findScrollbar(x, y);
+                    if (!found) return false;
+                    var el = found.el;
+                    var range = el.scrollHeight - el.clientHeight;
+                    // Match thumb motion to the available scrollbar travel distance.
+                    var thumb = Math.max(24, found.height * el.clientHeight / el.scrollHeight);
+                    active = {
+                        id: id, kind: kind, el: el, y: y, start: el.scrollTop,
+                        travel: Math.max(1, found.height - thumb), range: range
+                    };
+                    return true;
+                }
+
+                function move(y) {
+                    if (!active) return;
+                    active.el.scrollTop = active.start +
+                        (y - active.y) * active.range / active.travel;
+                }
+
+                // Touch listeners, rather than only pointer capture, are important on
+                // Android: native panning can cancel the pointer event stream.
+                document.addEventListener('touchstart', function(e) {
+                    if (e.touches.length !== 1) return;
+                    var t = e.changedTouches[0];
+                    if (begin(t.clientX, t.clientY, t.identifier, 'touch')) {
+                        e.preventDefault();
+                    }
+                }, {capture: true, passive: false});
+
+                document.addEventListener('touchmove', function(e) {
+                    if (!active || active.kind !== 'touch') return;
+                    for (var i = 0; i < e.changedTouches.length; i++) {
+                        var t = e.changedTouches[i];
+                        if (t.identifier === active.id) {
+                            e.preventDefault();
+                            move(t.clientY);
+                            break;
+                        }
+                    }
+                }, {capture: true, passive: false});
+
+                function touchEnd(e) {
+                    if (!active || active.kind !== 'touch') return;
+                    for (var i = 0; i < e.changedTouches.length; i++) {
+                        if (e.changedTouches[i].identifier === active.id) {
+                            active = null;
+                            break;
+                        }
+                    }
+                }
+                document.addEventListener('touchend', touchEnd, true);
+                document.addEventListener('touchcancel', touchEnd, true);
+
+                // Keep the same behaviour for a mouse or stylus dragging a thumb.
+                document.addEventListener('pointerdown', function(e) {
+                    if (e.pointerType === 'touch' || e.button !== 0) return;
+                    if (begin(e.clientX, e.clientY, e.pointerId, 'pointer')) {
+                        try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
+                        e.preventDefault();
+                    }
+                }, true);
+                document.addEventListener('pointermove', function(e) {
+                    if (!active || active.kind !== 'pointer' || e.pointerId !== active.id)
+                        return;
+                    e.preventDefault();
+                    move(e.clientY);
+                }, true);
+                function pointerEnd(e) {
+                    if (active && active.kind === 'pointer' && e.pointerId === active.id)
+                        active = null;
+                }
+                document.addEventListener('pointerup', pointerEnd, true);
+                document.addEventListener('pointercancel', pointerEnd, true);
+                window.addEventListener('blur', function() { active = null; });
+            })();
+            """.trimIndent(), null
+        )
     }
 
     /** Development-only timer-delay diagnostics; never a watchdog or reload trigger. */
