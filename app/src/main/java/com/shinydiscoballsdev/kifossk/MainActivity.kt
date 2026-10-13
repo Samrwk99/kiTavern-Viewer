@@ -13,7 +13,6 @@ import android.net.Uri
 import android.graphics.Point
 import android.os.Build
 import android.os.Bundle
-import android.os.Parcel
 import android.os.Environment
 import android.util.Log
 import android.view.MotionEvent
@@ -55,6 +54,7 @@ class MainActivity : AppCompatActivity() {
     private var settingsFragment: SettingsFragment? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingWebPermission: PermissionRequest? = null
+    private val fileChooserResultCode = 1
 
     private lateinit var noPagePinger: NoPagePinger
     private var activityResumed = false
@@ -87,9 +87,7 @@ class MainActivity : AppCompatActivity() {
     // continue using the same output stream across Activity recreation.
     private data class RetainedBrowser(
         val view: WebView,
-        val downloads: BlobDownloaderInterface,
-        val fileCallback: ValueCallback<Array<Uri>>?,
-        val permissionRequest: PermissionRequest?
+        val downloads: BlobDownloaderInterface
     )
     private var retainedDownloadBridge: BlobDownloaderInterface? = null
     private val blobDownloader: BlobDownloaderInterface
@@ -115,23 +113,11 @@ class MainActivity : AppCompatActivity() {
         completePendingWebPermission()
     }
 
-    // ActivityResultRegistry re-delivers an outstanding file-picker result to a
-    // recreated Activity. Its WebView callback is retained with the live WebView.
-    private val fileChooserLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val files = if (result.resultCode == RESULT_OK && result.data != null) {
-            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-        } else {
-            null
-        }
-        filePathCallback?.onReceiveValue(files)
-        filePathCallback = null
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         applyTheme()
         super.onCreate(savedInstanceState)
+        requestPermissionsIfNeeded()
+
         configureKeyboardInsets()
         container = FrameLayout(this)
         container.setBackgroundColor(Color.parseColor("#1a1a2e"))
@@ -152,7 +138,6 @@ class MainActivity : AppCompatActivity() {
         )
 
         setupWebView(savedInstanceState)
-        requestPermissionsIfNeeded()
 
         // Start independently of the Activity lifecycle. Never stop the service in onDestroy().
         if (KioskPrefs.getKeepAlive(this)) {
@@ -289,30 +274,26 @@ class MainActivity : AppCompatActivity() {
                 var originalTranslate = '';
                 var lastLift = 0;
                 var scheduled = false;
-                var overlayUpdateScheduled = false;
-
-                // Menus next to the composer (e.g. SillyTavern's Popper menus)
-                // can live elsewhere in the DOM. Translating the composer does
-                // not trigger the viewport resize they use to recalculate their
-                // anchor. Notify them only when the composer actually moves.
-                function updateAnchoredMenus() {
-                    if (overlayUpdateScheduled) return;
-                    overlayUpdateScheduled = true;
-                    window.requestAnimationFrame(function () {
-                        overlayUpdateScheduled = false;
-                        window.dispatchEvent(new Event('resize'));
-                    });
-                }
+                var composerResizeObserver = window.ResizeObserver ?
+                    new ResizeObserver(schedule) : null;
 
                 function reset() {
-                    var moved = adjustedElement && lastLift !== 0;
-                    if (adjustedElement) adjustedElement.style.translate = originalTranslate;
+                    if (adjustedElement) {
+                        adjustedElement.style.translate = originalTranslate;
+                        if (composerResizeObserver) composerResizeObserver.unobserve(adjustedElement);
+                    }
+                    if (adjustedScrollbar) {
+                        adjustedScrollbar.style.removeProperty('--kiTavernScrollbarBottomSpace');
+                    }
+                    if (adjustedShell) {
+                        adjustedShell.style.height = originalShellHeight;
+                        adjustedShell.style.maxHeight = originalShellMaxHeight;
+                    }
                     adjustedElement = null;
                     adjustedScrollbar = null;
                     adjustedShell = null;
                     originalTranslate = '';
                     lastLift = 0;
-                    if (moved) updateAnchoredMenus();
                 }
 
                 function positionComposer() {
@@ -381,7 +362,6 @@ class MainActivity : AppCompatActivity() {
                     if (lift !== lastLift) {
                         lastLift = lift;
                         bar.style.translate = lift > 0 ? ('0px -' + lift + 'px') : originalTranslate;
-                        updateAnchoredMenus();
                     }
 
                     // The keyboard overlays the WebView, so the chat's scrollbar
@@ -512,8 +492,6 @@ class MainActivity : AppCompatActivity() {
         val forceReload = intent?.getBooleanExtra(EXTRA_RELOAD, false) == true
         val retained = lastCustomNonConfigurationInstance as? RetainedBrowser
         retainedDownloadBridge = retained?.downloads
-        filePathCallback = retained?.fileCallback
-        pendingWebPermission = retained?.permissionRequest
         val retainedWebView = retained?.view
         webView = createConfiguredWebView(retainedWebView)
         container.addView(
@@ -633,8 +611,6 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                // Old documents/iframes cannot start new native downloads after navigation.
-                blobDownloader.invalidatePageCapability()
                 invalidateKeyboardLift()
                 // Only ping when the local fallback has fully loaded and is idle.
                 mainFrameLoading = true
@@ -721,7 +697,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 return try {
-                    fileChooserLauncher.launch(chooserIntent)
+                    startActivityForResult(chooserIntent, fileChooserResultCode)
                     true
                 } catch (e: Exception) {
                     Log.e(TAG, "Unable to open file chooser", e)
@@ -827,12 +803,7 @@ class MainActivity : AppCompatActivity() {
 
         (deadWebView.parent as? ViewGroup)?.removeView(deadWebView)
         // A terminated renderer cannot finish its active Blob transfers.
-        retainedDownloadBridge?.invalidatePageCapability()
         retainedDownloadBridge?.cancelAllDownloads()
-        filePathCallback?.onReceiveValue(null)
-        filePathCallback = null
-        pendingWebPermission?.deny()
-        pendingWebPermission = null
         try {
             deadWebView.destroy()
         } catch (e: Exception) {
@@ -878,11 +849,11 @@ class MainActivity : AppCompatActivity() {
             val payload = dataUrl.substring(commaIndex + 1)
             val mimeType = header.substringBefore(';').ifBlank { "text/plain" }
             val name = "download" + mimeToExtension(mimeType)
-            // Decode/write on a bounded background worker rather than the UI thread.
-            blobDownloader.downloadDataUrlAsync(
-                payload, mimeType, name,
-                header.split(';').any { it.equals("base64", ignoreCase = true) }
-            )
+            if (header.split(';').any { it.equals("base64", ignoreCase = true) }) {
+                blobDownloader.downloadBase64(payload, mimeType, name)
+            } else {
+                blobDownloader.downloadText(Uri.decode(payload), mimeType, name)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Could not process data URL download", e)
             Toast.makeText(this, "Download failed", Toast.LENGTH_SHORT).show()
@@ -890,24 +861,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun injectBlobInterceptor(targetView: WebView) {
-        // An unpredictable per-document capability is available only to the main
-        // page's injected closure. Untrusted iframes cannot start native downloads
-        // even though Android exposes addJavascriptInterface to all frames.
-        if (!UrlValidator.isValid(targetView.url)) return
-        val capability = JSONObject.quote(blobDownloader.newPageCapability())
         val js = """
             (function() {
-                // Rebind on history/BFCache restore without double-patching URL.
-                if (window.__blobInterceptorInstalled) {
-                    if (window.__kiTavernUpdateCapability)
-                        window.__kiTavernUpdateCapability($capability);
-                    return;
-                }
+                if (window.__blobInterceptorInstalled) return;
                 window.__blobInterceptorInstalled = true;
-                var pageCapability = $capability;
-                window.__kiTavernUpdateCapability = function(value) {
-                    pageCapability = value;
-                };
                 window.__blobRegistry = window.__blobRegistry || {};
 
                 var create = URL.createObjectURL;
@@ -925,8 +882,8 @@ class MainActivity : AppCompatActivity() {
                 // Stream Blob slices across the bridge. Do not materialize the whole
                 // file as a Base64 string in JavaScript and again in Kotlin.
                 window.__kiTavernSaveBlob = function(blob, filename) {
-                    var token = BlobDownloader.beginDownload(pageCapability,
-                        blob.type || 'application/octet-stream', filename || 'download');
+                    var token = BlobDownloader.beginDownload(blob.type || 'application/octet-stream',
+                        filename || 'download');
                     if (!token) return;
                     var offset = 0;
                     var chunkSize = 192 * 1024;
@@ -1311,6 +1268,19 @@ class MainActivity : AppCompatActivity() {
         return super.dispatchTouchEvent(event)
     }
 
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == fileChooserResultCode) {
+            val results = if (data == null || resultCode != RESULT_OK) {
+                null
+            } else {
+                WebChromeClient.FileChooserParams.parseResult(resultCode, data)
+            }
+            filePathCallback?.onReceiveValue(results)
+            filePathCallback = null
+        }
+    }
+
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         if (intent == null) return
@@ -1357,20 +1327,7 @@ class MainActivity : AppCompatActivity() {
             val webViewState = Bundle()
             try {
                 if (webView.saveState(webViewState) != null) {
-                    val parcel = Parcel.obtain()
-                    try {
-                        parcel.writeBundle(webViewState)
-                        val bytes = parcel.dataSize()
-                        // Leave space in Binder's shared transaction budget for
-                        // Android/fragment state. Always retain the last URL above.
-                        if (bytes <= 300 * 1024) {
-                            outState.putBundle(STATE_WEBVIEW, webViewState)
-                        } else {
-                            Log.w(TAG, "WebView navigation history is too large to save ($bytes bytes)")
-                        }
-                    } finally {
-                        parcel.recycle()
-                    }
+                    outState.putBundle(STATE_WEBVIEW, webViewState)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Unable to save WebView navigation state", e)
@@ -1386,7 +1343,7 @@ class MainActivity : AppCompatActivity() {
             (webView.parent as? ViewGroup)?.removeView(webView)
             (webView.context as? MutableContextWrapper)?.baseContext = applicationContext
             handingWebViewToRecreatedActivity = true
-            return RetainedBrowser(webView, blobDownloader, filePathCallback, pendingWebPermission)
+            return RetainedBrowser(webView, blobDownloader)
         }
         return super.onRetainCustomNonConfigurationInstance()
     }
@@ -1410,11 +1367,9 @@ class MainActivity : AppCompatActivity() {
         }
         invalidateKeyboardLift()
         if (::noPagePinger.isInitialized) noPagePinger.close()
-        if (!handingWebViewToRecreatedActivity) {
-            filePathCallback?.onReceiveValue(null)
-            pendingWebPermission?.deny()
-        }
+        filePathCallback?.onReceiveValue(null)
         filePathCallback = null
+        pendingWebPermission?.deny()
         pendingWebPermission = null
 
         if (::webView.isInitialized && !handingWebViewToRecreatedActivity) {
@@ -1426,18 +1381,11 @@ class MainActivity : AppCompatActivity() {
                 webView.webViewClient = WebViewClient()
                 webView.destroy()
                 retainedDownloadBridge?.cancelAllDownloads()
-                retainedDownloadBridge?.close()
             } catch (e: Exception) {
                 Log.w(TAG, "WebView cleanup failed", e)
             }
         }
 
-        // The foreground service may survive this Activity, but it is not a
-        // second browser. Report that distinction rather than implying the
-        // webpage's JavaScript is still executing after permanent destruction.
-        if (!handingWebViewToRecreatedActivity && KioskPrefs.getKeepAlive(this)) {
-            Log.i(TAG, "Keep Alive remains enabled; Activity/WebView was destroyed")
-        }
         // IMPORTANT: KeepAliveService is intentionally not stopped here.
         super.onDestroy()
     }
