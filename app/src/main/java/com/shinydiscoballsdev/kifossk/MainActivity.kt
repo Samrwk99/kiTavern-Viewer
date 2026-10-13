@@ -281,6 +281,11 @@ class MainActivity : AppCompatActivity() {
                 var hiddenPx = 0;
                 var viewHeightPx = 0;
                 var adjustedElement = null;
+                var adjustedScrollbar = null;
+                var adjustedShell = null;
+                var originalShellHeight = '';
+                var originalShellMaxHeight = '';
+                var naturalShellHeight = 0;
                 var originalTranslate = '';
                 var lastLift = 0;
                 var scheduled = false;
@@ -303,6 +308,8 @@ class MainActivity : AppCompatActivity() {
                     var moved = adjustedElement && lastLift !== 0;
                     if (adjustedElement) adjustedElement.style.translate = originalTranslate;
                     adjustedElement = null;
+                    adjustedScrollbar = null;
+                    adjustedShell = null;
                     originalTranslate = '';
                     lastLift = 0;
                     if (moved) updateAnchoredMenus();
@@ -321,12 +328,6 @@ class MainActivity : AppCompatActivity() {
                         return;
                     }
 
-                    if (adjustedElement !== bar) {
-                        reset();
-                        adjustedElement = bar;
-                        originalTranslate = bar.style.translate || '';
-                    }
-
                     // Convert measured Android screen pixels to page CSS pixels.
                     // Using the actual WebView height accounts for the page's scale.
                     var pageHeight = window.innerHeight;
@@ -338,6 +339,40 @@ class MainActivity : AppCompatActivity() {
                     }
                     usableBottom -= 10; // small gap above the keyboard
 
+                    // SillyTavern's chat and composer are flex children of #sheld.
+                    // Shrinking their parent makes BOTH fit above the keyboard,
+                    // instead of moving only the composer and scrollbar thumb.
+                    var chat = document.getElementById('chat');
+                    var shell = document.getElementById('sheld');
+                    if (chat && shell && shell.contains(chat) && shell.contains(bar)) {
+                        if (adjustedShell !== shell) {
+                            reset();
+                            adjustedShell = shell;
+                            originalShellHeight = shell.style.height;
+                            originalShellMaxHeight = shell.style.maxHeight;
+                            naturalShellHeight = shell.getBoundingClientRect().height;
+                        }
+                        var availableHeight = Math.max(100, Math.floor(
+                            usableBottom - shell.getBoundingClientRect().top));
+                        var nextHeight = Math.min(naturalShellHeight, availableHeight) + 'px';
+                        if (shell.style.height !== nextHeight || shell.style.maxHeight !== nextHeight) {
+                            var atBottom = chat.scrollHeight - chat.clientHeight - chat.scrollTop < 32;
+                            shell.style.height = nextHeight;
+                            shell.style.maxHeight = nextHeight;
+                            if (atBottom) chat.scrollTop = chat.scrollHeight;
+                        }
+                        return;
+                    }
+                    if (adjustedShell) reset();
+
+                    // Fallback for pages without SillyTavern's flex chat container.
+                    if (adjustedElement !== bar) {
+                        reset();
+                        adjustedElement = bar;
+                        originalTranslate = bar.style.translate || '';
+                        if (composerResizeObserver) composerResizeObserver.observe(bar);
+                    }
+
                     // getBoundingClientRect includes our previous lift. Add it back
                     // before computing the next lift so repeated events don't drift.
                     var naturalBottom = bar.getBoundingClientRect().bottom + lastLift;
@@ -347,6 +382,22 @@ class MainActivity : AppCompatActivity() {
                         lastLift = lift;
                         bar.style.translate = lift > 0 ? ('0px -' + lift + 'px') : originalTranslate;
                         updateAnchoredMenus();
+                    }
+
+                    // The keyboard overlays the WebView, so the chat's scrollbar
+                    // still extends behind it and behind the lifted composer.
+                    // Shorten only the scrollbar track, not the chat layout.
+                    if (adjustedScrollbar && adjustedScrollbar !== chat) {
+                        adjustedScrollbar.style.removeProperty('--kiTavernScrollbarBottomSpace');
+                    }
+                    adjustedScrollbar = chat;
+                    if (chat) {
+                        var chatRect = chat.getBoundingClientRect();
+                        var visibleBottom = Math.min(usableBottom,
+                            bar.getBoundingClientRect().top - 4);
+                        var blocked = Math.max(0, Math.min(chatRect.height - 24,
+                            Math.ceil(chatRect.bottom - visibleBottom)));
+                        chat.style.setProperty('--kiTavernScrollbarBottomSpace', blocked + 'px');
                     }
                 }
 
@@ -473,7 +524,10 @@ class MainActivity : AppCompatActivity() {
             )
         )
         // A retained/restored WebView may never fire onPageFinished again.
-        webView.post { installKeyboardLift(webView) }
+        webView.post {
+            installKeyboardLift(webView)
+            installScrollbarDrag(webView)
+        }
 
         // If this is a configuration/recreation hand-off, keep the same WebView object
         // and its live DOM/JS heap. An explicit EXTRA_RELOAD still overrides retention.
@@ -532,6 +586,8 @@ class MainActivity : AppCompatActivity() {
         val view = existing ?: WebView(MutableContextWrapper(this))
         (view.context as? MutableContextWrapper)?.baseContext = this
         view.setBackgroundColor(Color.parseColor("#1a1a2e"))
+        // Disable Android's overscroll edge glow; the thumb highlight is CSS-only.
+        view.overScrollMode = android.view.View.OVER_SCROLL_NEVER
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             // Keep the renderer at important priority even when this WebView is not visible.
@@ -592,6 +648,7 @@ class MainActivity : AppCompatActivity() {
                 if (view != null) {
                     injectBlobInterceptor(view)
                     installKeyboardLift(view)
+                    installScrollbarDrag(view)
                     installDebugHeartbeat(view)
                 }
                 mainFrameLoading = false
@@ -926,6 +983,181 @@ class MainActivity : AppCompatActivity() {
             })();
         """.trimIndent()
         targetView.evaluateJavascript(js, null)
+    }
+
+    /** Let scrollbar drags continue horizontally away from the scrollbar's narrow track. */
+    private fun installScrollbarDrag(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        target.evaluateJavascript(
+            """
+            (function() {
+                if (window.__kiTavernScrollbarDragInstalled) return;
+                window.__kiTavernScrollbarDragInstalled = true;
+
+                var active = null;
+                // Keep the chosen visible width separate from the larger touch target.
+                var style = document.createElement('style');
+                style.textContent =
+                    '::-webkit-scrollbar { width: 12px; }' +
+                    // Reserve the part of the chat scrollbar hidden by the
+                    // keyboard/lifted composer as a transparent bottom button.
+                    // This moves the native thumb's travel range above both.
+                    '#chat::-webkit-scrollbar-button:vertical:end:increment {' +
+                    'display: block !important;' +
+                    'height: var(--kiTavernScrollbarBottomSpace, 0px) !important;' +
+                    'background: transparent !important;' +
+                    'border: 0 !important;' +
+                    'box-shadow: none !important;' +
+                    '}';
+                (document.head || document.documentElement).appendChild(style);
+
+                // Change only the thumb colour when pressed. Preserve its existing
+                // transparent border/shape so it does not appear to get wider.
+                var pressedClass = '__kiTavernScrollbarPressed';
+                var pressedStyle = document.createElement('style');
+                pressedStyle.textContent =
+                    '.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb {' +
+                    'background-color: #2196F3 !important;' +
+                    'background-clip: padding-box !important;' +
+                    'background-image: none !important;' +
+                    'box-shadow: none !important;' +
+                    '-webkit-box-shadow: none !important;' +
+                    'filter: none !important;' +
+                    '-webkit-filter: none !important;' +
+                    'outline: 0 !important;' +
+                    'transition: none !important;' +
+                    '}';
+                (document.head || document.documentElement).appendChild(pressedStyle);
+
+                // A wider invisible grab zone makes narrow scrollbars easier to touch
+                // without changing their appearance or the webpage layout.
+                var grabZoneWidth = 32;
+
+                function setPressed(el, pressed) {
+                    el.classList.toggle(pressedClass, pressed);
+                    if (el === document.scrollingElement) {
+                        document.documentElement.classList.toggle(pressedClass, pressed);
+                    }
+                }
+
+                function endDrag() {
+                    if (!active) return;
+                    setPressed(active.el, false);
+                    active = null;
+                }
+
+                function findScrollbar(x, y) {
+                    // Include scrollable panels, not just the page's main scrollbar.
+                    var elements = document.elementsFromPoint(x, y);
+                    for (var i = 0; i < elements.length; i++) {
+                        for (var el = elements[i]; el && el.nodeType === 1;
+                             el = el.parentElement) {
+                            if (el === document.body || el === document.documentElement) continue;
+                            var rect = el.getBoundingClientRect();
+                            if (y < rect.top || y > rect.bottom || x > rect.right) continue;
+                            var style = getComputedStyle(el);
+                            if (style.overflowY !== 'auto' && style.overflowY !== 'scroll') continue;
+                            if (el.scrollHeight <= el.clientHeight + 1) continue;
+                            var bar = getComputedStyle(el, '::-webkit-scrollbar');
+                            var barWidth = parseFloat(bar.width) ||
+                                (style.scrollbarWidth === 'thin' ? 10 : 16);
+                            var blocked = el.id === 'chat' ?
+                                (parseFloat(style.getPropertyValue('--kiTavernScrollbarBottomSpace')) || 0) : 0;
+                            if (y > rect.bottom - blocked) continue;
+                            if (x >= rect.right - Math.max(grabZoneWidth, barWidth + 4)) {
+                                return {el: el, top: rect.top,
+                                    height: Math.max(1, rect.height - blocked)};
+                            }
+                        }
+                    }
+                    var root = document.scrollingElement;
+                    if (root && root.scrollHeight > root.clientHeight + 1 &&
+                        x >= innerWidth - grabZoneWidth) {
+                        return {el: root, top: 0, height: innerHeight};
+                    }
+                    return null;
+                }
+
+                function begin(x, y, id, kind) {
+                    if (active) return false;
+                    var found = findScrollbar(x, y);
+                    if (!found) return false;
+                    var el = found.el;
+                    var range = el.scrollHeight - el.clientHeight;
+                    // Match thumb motion to the available scrollbar travel distance.
+                    var thumb = Math.max(24, found.height * el.clientHeight / el.scrollHeight);
+                    active = {
+                        id: id, kind: kind, el: el, y: y, start: el.scrollTop,
+                        travel: Math.max(1, found.height - thumb), range: range
+                    };
+                    setPressed(el, true);
+                    return true;
+                }
+
+                function move(y) {
+                    if (!active) return;
+                    active.el.scrollTop = active.start +
+                        (y - active.y) * active.range / active.travel;
+                }
+
+                // Touch listeners, rather than only pointer capture, are important on
+                // Android: native panning can cancel the pointer event stream.
+                document.addEventListener('touchstart', function(e) {
+                    if (e.touches.length !== 1) return;
+                    var t = e.changedTouches[0];
+                    if (begin(t.clientX, t.clientY, t.identifier, 'touch')) {
+                        e.preventDefault();
+                    }
+                }, {capture: true, passive: false});
+
+                document.addEventListener('touchmove', function(e) {
+                    if (!active || active.kind !== 'touch') return;
+                    for (var i = 0; i < e.changedTouches.length; i++) {
+                        var t = e.changedTouches[i];
+                        if (t.identifier === active.id) {
+                            e.preventDefault();
+                            move(t.clientY);
+                            break;
+                        }
+                    }
+                }, {capture: true, passive: false});
+
+                function touchEnd(e) {
+                    if (!active || active.kind !== 'touch') return;
+                    for (var i = 0; i < e.changedTouches.length; i++) {
+                        if (e.changedTouches[i].identifier === active.id) {
+                            endDrag();
+                            break;
+                        }
+                    }
+                }
+                document.addEventListener('touchend', touchEnd, true);
+                document.addEventListener('touchcancel', touchEnd, true);
+
+                // Keep the same behaviour for a mouse or stylus dragging a thumb.
+                document.addEventListener('pointerdown', function(e) {
+                    if (e.pointerType === 'touch' || e.button !== 0) return;
+                    if (begin(e.clientX, e.clientY, e.pointerId, 'pointer')) {
+                        try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
+                        e.preventDefault();
+                    }
+                }, true);
+                document.addEventListener('pointermove', function(e) {
+                    if (!active || active.kind !== 'pointer' || e.pointerId !== active.id)
+                        return;
+                    e.preventDefault();
+                    move(e.clientY);
+                }, true);
+                function pointerEnd(e) {
+                    if (active && active.kind === 'pointer' && e.pointerId === active.id)
+                        endDrag();
+                }
+                document.addEventListener('pointerup', pointerEnd, true);
+                document.addEventListener('pointercancel', pointerEnd, true);
+                window.addEventListener('blur', endDrag);
+            })();
+            """.trimIndent(), null
+        )
     }
 
     /** Development-only timer-delay diagnostics; never a watchdog or reload trigger. */
