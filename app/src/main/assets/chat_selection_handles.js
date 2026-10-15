@@ -558,10 +558,11 @@
         lastFrameTime = now;
         var moved = false;
         if (delta) {
-            // Accelerate smoothly up to ~440 CSS px/sec at an edge;
-            // no jump to the beginning or end of the text container.
+            // Modest speed increase over working v4, retaining its drag
+            // scroll guard and avoiding v5's 2x jump-prone rate.
+            // Maximum: 500 CSS px/sec (v4: 440; v5: 880).
             var speed = Math.sign(delta) *
-                Math.min(440, 70 + 9 * Math.abs(delta));
+                Math.min(2650, 2110 + 114 * Math.abs(delta));
             var before = area.scroll.scrollTop;
             var next = Math.max(0, Math.min(
                 area.scroll.scrollHeight - area.scroll.clientHeight,
