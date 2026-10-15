@@ -58,13 +58,15 @@
     var correctedExternalScrolls = 0;
 
     // Start at 850 px/s, reaching 2048 px/s after 2 seconds.
-    // Then double smoothly every 2 seconds without a fixed maximum.
-    // Leaving the edge, reversing, reaching an end or releasing resets it.
+    // Continue to 4096 px/s at 4 seconds, then apply a configurable
+    // multiplier every further 2 seconds. Values between these times
+    // interpolate smoothly; leaving the edge, reversing, or stopping resets it.
     var SELECTION_SCROLL_START_PX_PER_SECOND = 850;
     var SELECTION_SCROLL_MAX_PX_PER_SECOND = 2048; // Speed at 2 seconds
     var SELECTION_SCROLL_RAMP_SECONDS = 2.0;
-    var SELECTION_SCROLL_LONG_HOLD_MULTIPLIER = 2.0;
+    var SELECTION_SCROLL_LONG_HOLD_MULTIPLIER = 2.0; // Fixed: 2s -> 4s
     var SELECTION_SCROLL_LONG_HOLD_INTERVAL_SECONDS = 2.0;
+    var SELECTION_SCROLL_AFTER_4S_MULTIPLIER = 2.0; // Edit this: 2.1, 4, etc.
 
     var DOCUMENT_SCROLL = document.scrollingElement || document.documentElement;
     var EXCLUDE = 'a,button,input,textarea,select,option,label,summary,' +
@@ -573,21 +575,31 @@
                 drag.edgeScrollDirection = direction;
                 drag.edgeScrollElapsedSeconds = 0;
             }
-            // Stage 1: gentle acceleration to 2048 after 2 seconds.
-            // Stage 2: smoothly double speed every additional 2 seconds.
+            // 0-2s: 850 -> 2048; 2-4s: 2048 -> 4096 (unchanged).
+            // Beyond 4s: smoothly multiply the 4096 speed by the adjustable
+            // factor once per additional 2 seconds, with no speed discontinuity.
             var elapsed = drag.edgeScrollElapsedSeconds;
             var speedMagnitude;
+            var fourSecondMark = SELECTION_SCROLL_RAMP_SECONDS +
+                SELECTION_SCROLL_LONG_HOLD_INTERVAL_SECONDS;
             if (elapsed <= SELECTION_SCROLL_RAMP_SECONDS) {
                 var progress = Math.min(1, elapsed / SELECTION_SCROLL_RAMP_SECONDS);
                 var eased = progress * progress * (3 - 2 * progress);
                 speedMagnitude = SELECTION_SCROLL_START_PX_PER_SECOND +
                     (SELECTION_SCROLL_MAX_PX_PER_SECOND -
                         SELECTION_SCROLL_START_PX_PER_SECOND) * eased;
-            } else {
+            } else if (elapsed <= fourSecondMark) {
                 var holdIntervals = (elapsed - SELECTION_SCROLL_RAMP_SECONDS) /
                     SELECTION_SCROLL_LONG_HOLD_INTERVAL_SECONDS;
                 speedMagnitude = SELECTION_SCROLL_MAX_PX_PER_SECOND *
                     Math.pow(SELECTION_SCROLL_LONG_HOLD_MULTIPLIER, holdIntervals);
+            } else {
+                var laterIntervals = (elapsed - fourSecondMark) /
+                    SELECTION_SCROLL_LONG_HOLD_INTERVAL_SECONDS;
+                var speedAtFourSeconds = SELECTION_SCROLL_MAX_PX_PER_SECOND *
+                    SELECTION_SCROLL_LONG_HOLD_MULTIPLIER;
+                speedMagnitude = speedAtFourSeconds *
+                    Math.pow(SELECTION_SCROLL_AFTER_4S_MULTIPLIER, laterIntervals);
             }
             var speed = direction * speedMagnitude;
             var before = area.scroll.scrollTop;
