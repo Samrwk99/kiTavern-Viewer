@@ -28,6 +28,7 @@ import android.webkit.WebViewRenderProcessClient
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -50,7 +51,32 @@ import java.net.URLEncoder
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
+    private val selectionToolbar by lazy { SelectionToolbar(this) }
     private lateinit var container: FrameLayout
+    // A native ACTION_DOWN can reach us before Chromium's compositor takes the
+    // scrollbar gesture. Keep a passive snapshot of the *actual thumb bounds*
+    // so we only intercept a new press on/near that thumb, never its whole track.
+    private class ScrollbarTouchBridge {
+        data class Bounds(
+            val scope: String, val right: Float, val top: Float, val bottom: Float,
+            val viewportWidth: Float, val viewportHeight: Float
+        )
+        @Volatile var bounds: Bounds? = null
+
+        @JavascriptInterface
+        fun report(scope: String, right: Float, top: Float, bottom: Float,
+                   viewportWidth: Float, viewportHeight: Float) {
+            if (scope != "chat" && scope != "root") return
+            if (!right.isFinite() || !top.isFinite() || !bottom.isFinite() ||
+                !viewportWidth.isFinite() || !viewportHeight.isFinite() ||
+                viewportWidth < 1 || viewportHeight < 1 || bottom <= top ||
+                bottom - top > viewportHeight + 40 || right < 1 || right > viewportWidth + 1) return
+            bounds = Bounds(scope, right, top, bottom, viewportWidth, viewportHeight)
+        }
+        @JavascriptInterface
+        fun clear() { bounds = null }
+    }
+
     private var settingsFragment: SettingsFragment? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingWebPermission: PermissionRequest? = null
@@ -146,6 +172,7 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                if (selectionToolbar.dismissOnBack()) return
                 if (settingsFragment != null) closeSettings() else showSettings()
             }
         })
@@ -163,8 +190,64 @@ class MainActivity : AppCompatActivity() {
      */
     private fun configureKeyboardInsets() {
         @Suppress("DEPRECATION")
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN)
+        updateKeyboardStartupMode()
         WindowCompat.setDecorFitsSystemWindows(window, false)
+    }
+
+    /** Keep Android's initial IME state hidden when chat auto-focus is disabled. */
+    private fun updateKeyboardStartupMode() {
+        val state = if (KioskPrefs.getAutoFocusChatInput(this)) 0 else
+            WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+        @Suppress("DEPRECATION")
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or state)
+    }
+
+    /** SillyTavern focuses #send_textarea programmatically on chat changes.
+     *  Ignore that automatic focus only when the setting is off; explicit taps
+     *  on the composer still focus it normally. Other websites are untouched.
+     */
+    private fun updateChatFocusPolicy(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        val autoFocus = KioskPrefs.getAutoFocusChatInput(this)
+        target.evaluateJavascript(
+            """
+            (function() {
+                var state = window.__kiTavernFocusPolicy;
+                if (!state) {
+                    state = {autoFocus: true, allowedUntil: 0};
+                    window.__kiTavernFocusPolicy = state;
+                    function isComposer(el) {
+                        return el && el.nodeType === 1 &&
+                            (el.id === 'send_textarea' ||
+                             (el.closest && el.closest('#send_textarea')));
+                    }
+                    // Only an actual interaction with the composer opts in to
+                    // keyboard focus. Clicking a message/chat elsewhere doesn't.
+                    function allowUserFocus(e) {
+                        if (isComposer(e.target))
+                            state.allowedUntil = performance.now() + 1600;
+                    }
+                    document.addEventListener('pointerdown', allowUserFocus, true);
+                    document.addEventListener('touchstart', allowUserFocus, true);
+                    document.addEventListener('mousedown', allowUserFocus, true);
+                    document.addEventListener('focusin', function(e) {
+                        if (!state.autoFocus && isComposer(e.target) &&
+                            performance.now() > state.allowedUntil) {
+                            e.target.blur();
+                        }
+                    }, true);
+                }
+                state.autoFocus = $autoFocus;
+                if (!state.autoFocus && document.activeElement &&
+                    (document.activeElement.id === 'send_textarea' ||
+                     (document.activeElement.closest &&
+                      document.activeElement.closest('#send_textarea'))) &&
+                    performance.now() > state.allowedUntil) {
+                    document.activeElement.blur();
+                }
+            })();
+            """.trimIndent(), null
+        )
     }
 
     private fun installKeyboardInsetsListener() {
@@ -274,10 +357,28 @@ class MainActivity : AppCompatActivity() {
                 var originalTranslate = '';
                 var lastLift = 0;
                 var scheduled = false;
+                var popupRefreshScheduled = false;
                 var composerResizeObserver = window.ResizeObserver ?
                     new ResizeObserver(schedule) : null;
 
+                // SillyTavern's Options popup lives outside #sheld and is placed
+                // by Popper. The Android IME doesn't resize this WebView, so
+                // Popper otherwise keeps the old, keyboard-height position.
+                function refreshAnchoredMenus() {
+                    if (popupRefreshScheduled) return;
+                    var options = document.getElementById('options');
+                    var extensions = document.getElementById('extensionsMenu');
+                    if ((!options || getComputedStyle(options).display === 'none') &&
+                        (!extensions || getComputedStyle(extensions).display === 'none')) return;
+                    popupRefreshScheduled = true;
+                    requestAnimationFrame(function() {
+                        popupRefreshScheduled = false;
+                        window.dispatchEvent(new Event('resize'));
+                    });
+                }
+
                 function reset() {
+                    var changedShell = !!adjustedShell;
                     if (adjustedElement) {
                         adjustedElement.style.translate = originalTranslate;
                         if (composerResizeObserver) composerResizeObserver.unobserve(adjustedElement);
@@ -294,6 +395,7 @@ class MainActivity : AppCompatActivity() {
                     adjustedShell = null;
                     originalTranslate = '';
                     lastLift = 0;
+                    if (changedShell) refreshAnchoredMenus();
                 }
 
                 function positionComposer() {
@@ -301,9 +403,10 @@ class MainActivity : AppCompatActivity() {
                     var input = document.getElementById('send_textarea');
                     var bar = document.getElementById('form_sheld') ||
                               document.getElementById('send_form');
-                    var focused = input && (document.activeElement === input ||
-                                             input.contains(document.activeElement));
-                    if (!focused || !bar || !bar.isConnected || hiddenPx <= 0 ||
+                    // Keep the chat/composer lifted until the IME actually closes.
+                    // Tapping Options blurs the textarea *before* Android finishes
+                    // hiding the keyboard; resetting at blur makes the popup float.
+                    if (!bar || !bar.isConnected || hiddenPx <= 0 ||
                         viewHeightPx <= 0) {
                         reset();
                         return;
@@ -341,6 +444,7 @@ class MainActivity : AppCompatActivity() {
                             shell.style.height = nextHeight;
                             shell.style.maxHeight = nextHeight;
                             if (atBottom) chat.scrollTop = chat.scrollHeight;
+                            refreshAnchoredMenus();
                         }
                         return;
                     }
@@ -416,6 +520,9 @@ class MainActivity : AppCompatActivity() {
             else -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
         if (requestedOrientation != wantedOrientation) requestedOrientation = wantedOrientation
+
+        updateKeyboardStartupMode()
+        if (::webView.isInitialized) updateChatFocusPolicy(webView)
 
         if (KioskPrefs.getScreenOn(this)) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -504,7 +611,9 @@ class MainActivity : AppCompatActivity() {
         // A retained/restored WebView may never fire onPageFinished again.
         webView.post {
             installKeyboardLift(webView)
+            updateChatFocusPolicy(webView)
             installScrollbarDrag(webView)
+            installChatTextSelection(webView)
         }
 
         // If this is a configuration/recreation hand-off, keep the same WebView object
@@ -591,6 +700,179 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
         view.addJavascriptInterface(blobDownloader, "BlobDownloader")
+        // Reuse the bridge with retained WebViews (rotation does not re-inject
+        // JavaScript interfaces into an already-loaded page).
+        val scrollbarBridge = (view.tag as? ScrollbarTouchBridge)
+            ?: ScrollbarTouchBridge().also {
+                view.tag = it
+                view.addJavascriptInterface(it, "KiTavernScrollbarTouch")
+            }
+        selectionToolbar.attach(view)
+
+        // Resolve whether this press is on selectable page text *before* Android's
+        // long-click callback. Returning true for that gesture prevents Chromium
+        // from starting a second, competing set of native selection handles.
+        // Links, input fields and unknown/unready pages retain normal behaviour.
+        val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        var gestureSequence = 0
+        var downX = -1f
+        var downY = -1f
+        var customLongPressEligible = false
+        var customLongPressInProgress = false
+        var nativeScrollbarTouch = false
+        var nativeScrollbarPointerId = -1
+        var nativeScrollbarY = 0f
+        var nativeScrollbarScope = ""
+        var nativeScrollbarFrameQueued = false
+        // Keep no more than one move pending on the UI thread. Renderer messages
+        // for 120Hz touch screens must not accumulate faster than paint frames.
+        val nativeScrollbarMoveFrame = object : Runnable {
+            override fun run() {
+                nativeScrollbarFrameQueued = false
+                if (nativeScrollbarTouch) {
+                    view.evaluateJavascript(
+                        "window.__kiTavernScrollbarNative && " +
+                            "window.__kiTavernScrollbarNative.move($nativeScrollbarY);", null
+                    )
+                }
+            }
+        }
+        fun nativeScrollbarEnd(cancel: Boolean) {
+            if (!nativeScrollbarTouch) return
+            nativeScrollbarTouch = false
+            nativeScrollbarPointerId = -1
+            nativeScrollbarFrameQueued = false
+            view.removeCallbacks(nativeScrollbarMoveFrame)
+            view.evaluateJavascript(
+                "window.__kiTavernScrollbarNative && " +
+                    "window.__kiTavernScrollbarNative.end(${if (cancel) "true" else "false"},$nativeScrollbarY);",
+                null
+            )
+        }
+        fun thumbPress(event: MotionEvent): ScrollbarTouchBridge.Bounds? {
+            if (!UrlValidator.isValid(view.url) || view.width <= 0 || view.height <= 0) return null
+            val bounds = scrollbarBridge.bounds ?: return null
+            val x = event.x * bounds.viewportWidth / view.width
+            val y = event.y * bounds.viewportHeight / view.height
+            return bounds.takeIf {
+                x >= it.right - 32f && x <= it.right + 3f &&
+                    y >= it.top && y <= it.bottom
+            }
+        }
+        view.setOnTouchListener { _, event ->
+            // Intercept at the Android View boundary *before* Chromium can claim
+            // the native scrollbar drag on the compositor. Otherwise it may
+            // move without our blue pressed state and race the JS scroll guard.
+            if (nativeScrollbarTouch) {
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_MOVE -> {
+                        if (event.pointerCount != 1 ||
+                            event.getPointerId(0) != nativeScrollbarPointerId) {
+                            nativeScrollbarEnd(true)
+                        } else {
+                            val geometry = scrollbarBridge.bounds
+                            if (geometry != null) {
+                                nativeScrollbarY = event.y * geometry.viewportHeight / view.height
+                                if (!nativeScrollbarFrameQueued) {
+                                    nativeScrollbarFrameQueued = true
+                                    view.postOnAnimation(nativeScrollbarMoveFrame)
+                                }
+                            }
+                        }
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        val geometry = scrollbarBridge.bounds
+                        if (geometry != null && view.height > 0)
+                            nativeScrollbarY = event.y * geometry.viewportHeight / view.height
+                        nativeScrollbarEnd(false)
+                    }
+                    MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> nativeScrollbarEnd(true)
+                }
+                return@setOnTouchListener true
+            }
+            if (event.actionMasked == MotionEvent.ACTION_DOWN && event.pointerCount == 1) {
+                val hit = thumbPress(event)
+                if (hit != null) {
+                    ++gestureSequence
+                    customLongPressEligible = false
+                    customLongPressInProgress = false
+                    nativeScrollbarTouch = true
+                    nativeScrollbarPointerId = event.getPointerId(0)
+                    nativeScrollbarScope = hit.scope
+                    nativeScrollbarY = event.y * hit.viewportHeight / view.height
+                    val x = event.x * hit.viewportWidth / view.width
+                    // Zero velocity cancels an in-flight WebView fling at the
+                    // Android boundary, before the dedicated drag takes control.
+                    view.flingScroll(0, 0)
+                    view.evaluateJavascript(
+                        "window.__kiTavernScrollbarNative && " +
+                            "window.__kiTavernScrollbarNative.down($x,$nativeScrollbarY,'$nativeScrollbarScope');",
+                        null
+                    )
+                    return@setOnTouchListener true
+                }
+            }
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    customLongPressInProgress = false
+                    downX = event.x
+                    downY = event.y
+                    customLongPressEligible = false
+                    val sequence = ++gestureSequence
+                    if (UrlValidator.isValid(view.url) && view.width > 0 && view.height > 0) {
+                        val script = "window.__kiTavernChatSelect ? " +
+                            "window.__kiTavernChatSelect.probeAt(" +
+                            "${downX.toInt()},${downY.toInt()},${view.width},${view.height}) : false"
+                        view.evaluateJavascript(script) { result ->
+                            if (sequence == gestureSequence) {
+                                customLongPressEligible = result == "true"
+                            }
+                        }
+                    }
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (event.pointerCount != 1 ||
+                        kotlin.math.abs(event.x - downX) > touchSlop ||
+                        kotlin.math.abs(event.y - downY) > touchSlop
+                    ) {
+                        customLongPressEligible = false
+                        ++gestureSequence
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL,
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    if (customLongPressInProgress) {
+                        val api = if (event.actionMasked == MotionEvent.ACTION_UP)
+                            "androidPressReleased" else "androidPressCanceled"
+                        // Execute after the page receives the release. This is a
+                        // fallback when Chromium consumes the page's touchend.
+                        view.post {
+                            view.evaluateJavascript(
+                                "window.__kiTavernChatSelect && " +
+                                    "window.__kiTavernChatSelect.$api();", null
+                            )
+                        }
+                        customLongPressInProgress = false
+                    }
+                    customLongPressEligible = false
+                    ++gestureSequence
+                }
+            }
+            false // Never intercept normal WebView touch/scroll handling.
+        }
+        view.setOnLongClickListener {
+            if (!customLongPressEligible || !UrlValidator.isValid(view.url)) {
+                false // Keep Android's long-press actions on other elements.
+            } else {
+                if (diagnosticsEnabled) Log.d(TAG, "Custom text selection long-press activated")
+                customLongPressInProgress = true
+                val script = "window.__kiTavernChatSelect && " +
+                    "window.__kiTavernChatSelect.longPressAt(" +
+                    "${downX.toInt()},${downY.toInt()},${view.width},${view.height});"
+                view.evaluateJavascript(script, null)
+                true // Our handles own text selection; do not start Chromium's.
+            }
+        }
 
         view.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -610,8 +892,10 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                scrollbarBridge.bounds = null
                 super.onPageStarted(view, url, favicon)
                 invalidateKeyboardLift()
+                selectionToolbar.dismissOnBack()
                 // Only ping when the local fallback has fully loaded and is idle.
                 mainFrameLoading = true
                 recoveryNavigationPending = false
@@ -624,7 +908,9 @@ class MainActivity : AppCompatActivity() {
                 if (view != null) {
                     injectBlobInterceptor(view)
                     installKeyboardLift(view)
+                    updateChatFocusPolicy(view)
                     installScrollbarDrag(view)
+                    installChatTextSelection(view)
                     installDebugHeartbeat(view)
                 }
                 mainFrameLoading = false
@@ -952,6 +1238,49 @@ class MainActivity : AppCompatActivity() {
                 window.__kiTavernScrollbarDragInstalled = true;
 
                 var active = null;
+                var moveFrame = 0;
+                var pendingMoveY = null;
+                var nativeGeometryFrame = 0;
+                // Keep the native hit region aligned with the real scrollbar
+                // thumb. No extra visible scrollbar or overlay is created.
+                function currentPrimaryTrack() {
+                    var chat = document.getElementById('chat');
+                    if (chat && chat.isConnected && chat.scrollHeight > chat.clientHeight + 1) {
+                        var rect = chat.getBoundingClientRect();
+                        var chatStyle = getComputedStyle(chat);
+                        var blocked = parseFloat(chatStyle.getPropertyValue(
+                            '--kiTavernScrollbarBottomSpace')) || 0;
+                        if (rect.right > 0 && rect.top < innerHeight &&
+                            rect.bottom > 0 && rect.left < innerWidth &&
+                            (chatStyle.overflowY === 'auto' || chatStyle.overflowY === 'scroll')) {
+                            return {el: chat, top: rect.top, right: rect.right,
+                                height: Math.max(1, rect.height - blocked), isRoot: false};
+                        }
+                    }
+                    var root = document.scrollingElement;
+                    if (root && root.scrollHeight > root.clientHeight + 1)
+                        return {el: root, top: 0, right: innerWidth,
+                            height: innerHeight, isRoot: true};
+                    return null;
+                }
+                function publishNativeGeometry() {
+                    nativeGeometryFrame = 0;
+                    var bridge = window.KiTavernScrollbarTouch;
+                    if (!bridge) return;
+                    var track = currentPrimaryTrack();
+                    if (!track) { bridge.clear(); return; }
+                    var thumb = thumbGeometry(track);
+                    var tolerance = thumbVerticalTolerance(track, thumb);
+                    bridge.report(track.isRoot ? 'root' : 'chat', track.right,
+                        thumb.top - tolerance,
+                        thumb.top + thumb.height + tolerance,
+                        innerWidth, innerHeight);
+                }
+                function scheduleNativeGeometry() {
+                    if (!nativeGeometryFrame)
+                        nativeGeometryFrame = requestAnimationFrame(publishNativeGeometry);
+                }
+                var scrollStyleBeforeDrag = null;
                 // Keep the chosen visible width separate from the larger touch target.
                 var style = document.createElement('style');
                 style.textContent =
@@ -968,12 +1297,18 @@ class MainActivity : AppCompatActivity() {
                     '}';
                 (document.head || document.documentElement).appendChild(style);
 
-                // Change only the thumb colour when pressed. Preserve its existing
+                // Colour the actual scrollbar thumb when pressed, without overlays.
+                // Preserve its existing
                 // transparent border/shape so it does not appear to get wider.
                 var pressedClass = '__kiTavernScrollbarPressed';
                 var pressedStyle = document.createElement('style');
                 pressedStyle.textContent =
-                    '.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb {' +
+                    // Control blue only with our own drag class. Chromium's
+                    // scrollbar-thumb:active may remain active after touchend,
+                    // leaving the thumb permanently blue on some devices.
+                    // Higher specificity preserves the pressed colour over themes.
+                    '#chat.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb,' +
+                    '.__kiTavernScrollbarPressed.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb {' +
                     'background-color: #2196F3 !important;' +
                     'background-clip: padding-box !important;' +
                     'background-image: none !important;' +
@@ -986,9 +1321,15 @@ class MainActivity : AppCompatActivity() {
                     '}';
                 (document.head || document.documentElement).appendChild(pressedStyle);
 
-                // A wider invisible grab zone makes narrow scrollbars easier to touch
-                // without changing their appearance or the webpage layout.
+                // A wide horizontal tolerance remains useful on touchscreens, but
+                // a drag must start ON THE THUMB, never elsewhere in its track.
                 var grabZoneWidth = 32;
+                // Tiny thumbs get more vertical grab tolerance; large thumbs
+                // are already easy to hit and get almost none.
+                function thumbVerticalTolerance(track, thumb) {
+                    return Math.max(2, Math.min(18,
+                        20 * (1 - thumb.height / Math.max(1, track.height))));
+                }
 
                 function setPressed(el, pressed) {
                     el.classList.toggle(pressedClass, pressed);
@@ -997,18 +1338,54 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                function endDrag() {
+                function thumbGeometry(track) {
+                    var el = track.el;
+                    var range = Math.max(0, el.scrollHeight - el.clientHeight);
+                    var height = Math.min(track.height,
+                        Math.max(24, track.height * el.clientHeight / el.scrollHeight));
+                    var travel = Math.max(0, track.height - height);
+                    return {
+                        top: track.top + (range ?
+                            Math.max(0, Math.min(range, el.scrollTop)) / range * travel : 0),
+                        height: height, range: range, travel: travel
+                    };
+                }
+
+                // Only capture movement while a thumb press is active. Keeping a
+                // non-passive touchmove listener on the whole document slows down
+                // ordinary compositor-driven chat swipes on Android.
+                function restoreScrollStyle() {
+                    if (!scrollStyleBeforeDrag) return;
+                    var saved = scrollStyleBeforeDrag;
+                    scrollStyleBeforeDrag = null;
+                    for (var i = 0; i < saved.props.length; i++) {
+                        var prop = saved.props[i];
+                        if (prop.value) saved.el.style.setProperty(
+                            prop.name, prop.value, prop.priority);
+                        else saved.el.style.removeProperty(prop.name);
+                    }
+                }
+                function endDrag(cancelled) {
                     if (!active) return;
+                    document.removeEventListener('touchmove', onThumbTouchMove, true);
+                    if (moveFrame) cancelAnimationFrame(moveFrame);
+                    moveFrame = 0;
+                    if (!cancelled && pendingMoveY !== null) move(pendingMoveY);
+                    pendingMoveY = null;
                     setPressed(active.el, false);
                     active = null;
+                    window.__kiTavernScrollbarDragging = false;
+                    restoreScrollStyle();
                 }
 
                 function findScrollbar(x, y) {
-                    // Include scrollable panels, not just the page's main scrollbar.
                     var elements = document.elementsFromPoint(x, y);
+                    var checked = new Set();
                     for (var i = 0; i < elements.length; i++) {
                         for (var el = elements[i]; el && el.nodeType === 1;
                              el = el.parentElement) {
+                            if (checked.has(el)) continue;
+                            checked.add(el);
                             if (el === document.body || el === document.documentElement) continue;
                             var rect = el.getBoundingClientRect();
                             if (y < rect.top || y > rect.bottom || x > rect.right) continue;
@@ -1021,79 +1398,192 @@ class MainActivity : AppCompatActivity() {
                             var blocked = el.id === 'chat' ?
                                 (parseFloat(style.getPropertyValue('--kiTavernScrollbarBottomSpace')) || 0) : 0;
                             if (y > rect.bottom - blocked) continue;
-                            if (x >= rect.right - Math.max(grabZoneWidth, barWidth + 4)) {
-                                return {el: el, top: rect.top,
-                                    height: Math.max(1, rect.height - blocked)};
-                            }
+                            if (x < rect.right - Math.max(grabZoneWidth, barWidth + 4)) continue;
+                            var track = {el: el, top: rect.top, right: rect.right,
+                                height: Math.max(1, rect.height - blocked),
+                                barWidth: barWidth, isRoot: false};
+                            var thumb = thumbGeometry(track);
+                            var tolerance = thumbVerticalTolerance(track, thumb);
+                            if (y >= thumb.top - tolerance &&
+                                y <= thumb.top + thumb.height + tolerance) return track;
                         }
                     }
                     var root = document.scrollingElement;
                     if (root && root.scrollHeight > root.clientHeight + 1 &&
                         x >= innerWidth - grabZoneWidth) {
-                        return {el: root, top: 0, height: innerHeight};
+                        var track = {el: root, top: 0, right: innerWidth,
+                            height: innerHeight, barWidth: 12, isRoot: true};
+                        var thumb = thumbGeometry(track);
+                        var tolerance = thumbVerticalTolerance(track, thumb);
+                        if (y >= thumb.top - tolerance &&
+                            y <= thumb.top + thumb.height + tolerance) return track;
                     }
                     return null;
                 }
 
-                function begin(x, y, id, kind) {
+                function begin(x, y, id, kind, preferredTrack) {
                     if (active) return false;
-                    var found = findScrollbar(x, y);
+                    var found = preferredTrack || findScrollbar(x, y);
                     if (!found) return false;
-                    var el = found.el;
-                    var range = el.scrollHeight - el.clientHeight;
-                    // Match thumb motion to the available scrollbar travel distance.
-                    var thumb = Math.max(24, found.height * el.clientHeight / el.scrollHeight);
+                    var thumb = thumbGeometry(found);
                     active = {
-                        id: id, kind: kind, el: el, y: y, start: el.scrollTop,
-                        travel: Math.max(1, found.height - thumb), range: range
+                        id: id, kind: kind, el: found.el, y: y,
+                        start: found.el.scrollTop, travel: Math.max(1, thumb.travel),
+                        range: thumb.range, isRoot: found.isRoot,
+                        barWidth: found.barWidth,
+                        // A new thumb press owns the position, even if a fling
+                        // was already moving this element on the compositor.
+                        lastY: y, expectedTop: found.el.scrollTop
                     };
-                    setPressed(el, true);
+                    // During a thumb drag neither a site's smooth-scroll CSS nor
+                    // scroll snapping should animate our frame-by-frame updates.
+                    // Restore exactly what was there on release/cancellation.
+                    var names = ['scroll-behavior', 'scroll-snap-type'];
+                    scrollStyleBeforeDrag = {el: found.el, props: names.map(function(name) {
+                        return {name: name,
+                            value: found.el.style.getPropertyValue(name),
+                            priority: found.el.style.getPropertyPriority(name)};
+                    })};
+                    found.el.style.setProperty('scroll-behavior', 'auto', 'important');
+                    found.el.style.setProperty('scroll-snap-type', 'none', 'important');
+                    setPressed(found.el, true);
+                    window.__kiTavernScrollbarDragging = true;
+                    if (kind === 'touch') document.addEventListener('touchmove',
+                        onThumbTouchMove, {capture: true, passive: false});
+                    // Run immediately, including when the finger has not moved:
+                    // a previous kinetic fling must not keep carrying the thumb.
+                    move(y);
+                    scheduleMoveFrame();
                     return true;
                 }
 
                 function move(y) {
                     if (!active) return;
-                    active.el.scrollTop = active.start +
-                        (y - active.y) * active.range / active.travel;
+                    active.lastY = y;
+                    // Do not rebase to compositor momentum. The thumb press
+                    // takes priority over an earlier fling; rebasing made the
+                    // scrollbar stutter and drift away from the finger.
+                    var targetTop = Math.max(0, Math.min(active.range,
+                        active.start + (y - active.y) * active.range / active.travel));
+                    active.expectedTop = targetTop;
+                    if (Math.abs(active.el.scrollTop - targetTop) > 0.25)
+                        active.el.scrollTop = targetTop;
                 }
+                function scheduleMoveFrame() {
+                    if (moveFrame || !active) return;
+                    moveFrame = requestAnimationFrame(function () {
+                        moveFrame = 0;
+                        if (!active) return;
+                        var latestY = pendingMoveY;
+                        pendingMoveY = null;
+                        // Continue holding the desired scroll offset even if a
+                        // native fling tries to move the page between touchmoves.
+                        move(latestY === null ? active.lastY : latestY);
+                        scheduleMoveFrame();
+                    });
+                }
+                function queueMove(y) {
+                    pendingMoveY = y;
+                    scheduleMoveFrame();
+                }
+
+                // Android's touch listener claims a thumb press before WebView's
+                // compositor. JS handles motion/scrolling, but native owns the
+                // gesture, so a second (uncoloured) native thumb drag cannot start.
+                window.__kiTavernScrollbarNative = {
+                    down: function(x, y, scope) {
+                        var track = currentPrimaryTrack();
+                        if (track && (scope === (track.isRoot ? 'root' : 'chat')))
+                            begin(x, y, -1, 'native', track);
+                    },
+                    move: function(y) {
+                        if (active && active.kind === 'native') queueMove(y);
+                    },
+                    end: function(cancel, y) {
+                        if (!active || active.kind !== 'native') return;
+                        if (!cancel && typeof y === 'number') pendingMoveY = y;
+                        endDrag(!!cancel);
+                    }
+                };
+                // Passive geometry updates; never add a permanent non-passive
+                // touch listener to regular page scrolling.
+                document.addEventListener('scroll', scheduleNativeGeometry, true);
+                window.addEventListener('resize', scheduleNativeGeometry, {passive: true});
+                if (window.visualViewport)
+                    window.visualViewport.addEventListener('resize', scheduleNativeGeometry,
+                        {passive: true});
+                if (window.ResizeObserver) {
+                    var sizeObserver = new ResizeObserver(scheduleNativeGeometry);
+                    sizeObserver.observe(document.documentElement);
+                    var chatForSize = document.getElementById('chat');
+                    if (chatForSize) sizeObserver.observe(chatForSize);
+                }
+                if (window.MutationObserver) {
+                    var chatForChanges = document.getElementById('chat');
+                    if (chatForChanges) new MutationObserver(scheduleNativeGeometry)
+                        .observe(chatForChanges, {childList: true,
+                            attributes: true, attributeFilter: ['style', 'class']});
+                }
+                scheduleNativeGeometry();
 
                 // Touch listeners, rather than only pointer capture, are important on
                 // Android: native panning can cancel the pointer event stream.
                 document.addEventListener('touchstart', function(e) {
-                    if (e.touches.length !== 1) return;
+                    // A second finger interrupts a single-finger scrollbar drag.
+                    if (active && e.touches.length !== 1) endDrag(true);
+                    if (e.touches.length !== 1 ||
+                        (e.target.closest && e.target.closest('.ki-chat-select-control'))) return;
                     var t = e.changedTouches[0];
+                    // A fresh press on the moving thumb takes ownership of
+                    // the scroll immediately, even while the chat is flinging.
+                    // An existing finger sliding over the thumb is not a new
+                    // press and will continue its original page gesture.
+                    if (!e.cancelable) return;
                     if (begin(t.clientX, t.clientY, t.identifier, 'touch')) {
                         e.preventDefault();
+                        if (!e.defaultPrevented) endDrag(true);
+                        else e.stopImmediatePropagation();
                     }
                 }, {capture: true, passive: false});
 
-                document.addEventListener('touchmove', function(e) {
+                function onThumbTouchMove(e) {
                     if (!active || active.kind !== 'touch') return;
                     for (var i = 0; i < e.changedTouches.length; i++) {
                         var t = e.changedTouches[i];
                         if (t.identifier === active.id) {
+                            if (!e.cancelable) { endDrag(true); return; }
                             e.preventDefault();
-                            move(t.clientY);
+                            if (!e.defaultPrevented) { endDrag(true); return; }
+                            queueMove(t.clientY);
+                            e.stopImmediatePropagation();
                             break;
                         }
                     }
-                }, {capture: true, passive: false});
+                }
 
                 function touchEnd(e) {
                     if (!active || active.kind !== 'touch') return;
                     for (var i = 0; i < e.changedTouches.length; i++) {
                         if (e.changedTouches[i].identifier === active.id) {
-                            endDrag();
+                            endDrag(e.type === 'touchcancel');
                             break;
                         }
                     }
                 }
                 document.addEventListener('touchend', touchEnd, true);
                 document.addEventListener('touchcancel', touchEnd, true);
+                // Some Android WebViews swallow the matching touchend when a
+                // native scrollbar takes ownership of the gesture. In that case
+                // the corresponding touch pointerup still ends our pressed state.
+                document.addEventListener('pointerup', function(e) {
+                    if (active && active.kind === 'touch' && e.pointerType === 'touch')
+                        endDrag(false);
+                }, true);
 
                 // Keep the same behaviour for a mouse or stylus dragging a thumb.
                 document.addEventListener('pointerdown', function(e) {
-                    if (e.pointerType === 'touch' || e.button !== 0) return;
+                    if (e.pointerType === 'touch' || e.button !== 0 ||
+                        (e.target.closest && e.target.closest('.ki-chat-select-control'))) return;
                     if (begin(e.clientX, e.clientY, e.pointerId, 'pointer')) {
                         try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
                         e.preventDefault();
@@ -1103,7 +1593,7 @@ class MainActivity : AppCompatActivity() {
                     if (!active || active.kind !== 'pointer' || e.pointerId !== active.id)
                         return;
                     e.preventDefault();
-                    move(e.clientY);
+                    queueMove(e.clientY);
                 }, true);
                 function pointerEnd(e) {
                     if (active && active.kind === 'pointer' && e.pointerId === active.id)
@@ -1111,10 +1601,39 @@ class MainActivity : AppCompatActivity() {
                 }
                 document.addEventListener('pointerup', pointerEnd, true);
                 document.addEventListener('pointercancel', pointerEnd, true);
-                window.addEventListener('blur', endDrag);
+                // If the browser loses a gesture or the app backgrounds, always
+                // clear its pressed class and discard any pending drag frame.
+                document.addEventListener('lostpointercapture', function(e) {
+                    if (active && active.kind === 'pointer' && e.pointerId === active.id)
+                        endDrag(true);
+                }, true);
+                document.addEventListener('visibilitychange', function() {
+                    if (document.hidden) endDrag(true);
+                });
+                window.addEventListener('pagehide', function() { endDrag(true); });
+                window.addEventListener('blur', function() { endDrag(true); });
             })();
             """.trimIndent(), null
         )
+    }
+
+    /** Chat-first selection handles with bounded, smooth edge auto-scroll. */
+    private fun installChatTextSelection(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        try {
+            val script = assets.open("chat_selection_handles.js").bufferedReader().use { it.readText() }
+            target.evaluateJavascript(script) { result ->
+                // Surface missing assets/JavaScript errors in Logcat instead of
+                // silently proceeding as though selection injection succeeded.
+                if (result == "\"selection-v3\"" || result == "\"already installed\"") {
+                    Log.d(TAG, "Chat text selection controller ready ($result)")
+                } else {
+                    Log.w(TAG, "Chat text selection injection returned: $result")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not install chat text selection", e)
+        }
     }
 
     /** Development-only timer-delay diagnostics; never a watchdog or reload trigger. */
@@ -1366,6 +1885,7 @@ class MainActivity : AppCompatActivity() {
             if (observer.isAlive) observer.removeOnGlobalLayoutListener(keyboardLayoutListener)
         }
         invalidateKeyboardLift()
+        selectionToolbar.detach()
         if (::noPagePinger.isInitialized) noPagePinger.close()
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null

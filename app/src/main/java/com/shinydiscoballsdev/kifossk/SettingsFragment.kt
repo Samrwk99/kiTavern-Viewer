@@ -27,6 +27,7 @@ class SettingsFragment : Fragment() {
     private lateinit var switchScreenOn: SwitchCompat
     private lateinit var switchKeepAlive: SwitchCompat
     private lateinit var switchShowNotification: SwitchCompat
+    private lateinit var switchAutoFocusChatInput: SwitchCompat
     private lateinit var spinnerOrientation: Spinner
     private lateinit var spinnerTheme: Spinner
     private lateinit var btnSave: Button
@@ -57,6 +58,7 @@ class SettingsFragment : Fragment() {
         switchScreenOn = view.findViewById(R.id.switchScreenOn)
         switchKeepAlive = view.findViewById(R.id.switchKeepAlive)
         switchShowNotification = view.findViewById(R.id.switchShowNotification)
+        switchAutoFocusChatInput = view.findViewById(R.id.switchAutoFocusChatInput)
         spinnerOrientation = view.findViewById(R.id.spinnerOrientation)
         spinnerTheme = view.findViewById(R.id.spinnerTheme)
         btnSave = view.findViewById(R.id.buttonSave)
@@ -70,6 +72,7 @@ class SettingsFragment : Fragment() {
         switchScreenOn.isChecked = KioskPrefs.getScreenOn(ctx)
         switchKeepAlive.isChecked = KioskPrefs.getKeepAlive(ctx)
         switchShowNotification.isChecked = KioskPrefs.getShowNotification(ctx)
+        switchAutoFocusChatInput.isChecked = KioskPrefs.getAutoFocusChatInput(ctx)
 
         switchKeepAlive.setOnCheckedChangeListener { _, enabled ->
             KioskPrefs.setKeepAlive(ctx, enabled)
@@ -280,6 +283,7 @@ class SettingsFragment : Fragment() {
             switchScreenOn.isChecked,
             desiredKeepAlive,
             switchShowNotification.isChecked,
+            switchAutoFocusChatInput.isChecked,
             orientationMap[spinnerOrientation.selectedItemPosition] ?: "auto",
             themeMap[spinnerTheme.selectedItemPosition] ?: "dark"
         )
