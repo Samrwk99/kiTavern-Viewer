@@ -57,13 +57,14 @@
     var lastToolbarUpdate = 0;
     var correctedExternalScrolls = 0;
 
-    // Selection-handle autoscroll (CSS pixels per second): start gently and
-    // ramp up while a handle continuously scrolls near an edge. Letting go,
-    // leaving the edge zone, changing direction or hitting an end resets it.
-    // The maximum is the user's tested, reliable 2048 px/s setting.
+    // Start at 850 px/s, reaching 2048 px/s after 2 seconds.
+    // Then double smoothly every 2 seconds without a fixed maximum.
+    // Leaving the edge, reversing, reaching an end or releasing resets it.
     var SELECTION_SCROLL_START_PX_PER_SECOND = 850;
-    var SELECTION_SCROLL_MAX_PX_PER_SECOND = 2048;
-    var SELECTION_SCROLL_RAMP_SECONDS = 1.4;
+    var SELECTION_SCROLL_MAX_PX_PER_SECOND = 2048; // Speed at 2 seconds
+    var SELECTION_SCROLL_RAMP_SECONDS = 2.0;
+    var SELECTION_SCROLL_LONG_HOLD_MULTIPLIER = 2.0;
+    var SELECTION_SCROLL_LONG_HOLD_INTERVAL_SECONDS = 2.0;
 
     var DOCUMENT_SCROLL = document.scrollingElement || document.documentElement;
     var EXCLUDE = 'a,button,input,textarea,select,option,label,summary,' +
@@ -572,14 +573,23 @@
                 drag.edgeScrollDirection = direction;
                 drag.edgeScrollElapsedSeconds = 0;
             }
-            // Smoothly accelerate over time, not by jumping to the maximum
-            // when the finger moves a few pixels further beyond the edge.
-            var progress = Math.min(1,
-                drag.edgeScrollElapsedSeconds / SELECTION_SCROLL_RAMP_SECONDS);
-            var eased = progress * progress * (3 - 2 * progress);
-            var speed = direction * (SELECTION_SCROLL_START_PX_PER_SECOND +
-                (SELECTION_SCROLL_MAX_PX_PER_SECOND -
-                    SELECTION_SCROLL_START_PX_PER_SECOND) * eased);
+            // Stage 1: gentle acceleration to 2048 after 2 seconds.
+            // Stage 2: smoothly double speed every additional 2 seconds.
+            var elapsed = drag.edgeScrollElapsedSeconds;
+            var speedMagnitude;
+            if (elapsed <= SELECTION_SCROLL_RAMP_SECONDS) {
+                var progress = Math.min(1, elapsed / SELECTION_SCROLL_RAMP_SECONDS);
+                var eased = progress * progress * (3 - 2 * progress);
+                speedMagnitude = SELECTION_SCROLL_START_PX_PER_SECOND +
+                    (SELECTION_SCROLL_MAX_PX_PER_SECOND -
+                        SELECTION_SCROLL_START_PX_PER_SECOND) * eased;
+            } else {
+                var holdIntervals = (elapsed - SELECTION_SCROLL_RAMP_SECONDS) /
+                    SELECTION_SCROLL_LONG_HOLD_INTERVAL_SECONDS;
+                speedMagnitude = SELECTION_SCROLL_MAX_PX_PER_SECOND *
+                    Math.pow(SELECTION_SCROLL_LONG_HOLD_MULTIPLIER, holdIntervals);
+            }
+            var speed = direction * speedMagnitude;
             var before = area.scroll.scrollTop;
             var next = Math.max(0, Math.min(
                 area.scroll.scrollHeight - area.scroll.clientHeight,
