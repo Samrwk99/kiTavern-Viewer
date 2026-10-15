@@ -332,10 +332,28 @@ class MainActivity : AppCompatActivity() {
                 var originalTranslate = '';
                 var lastLift = 0;
                 var scheduled = false;
+                var popupRefreshScheduled = false;
                 var composerResizeObserver = window.ResizeObserver ?
                     new ResizeObserver(schedule) : null;
 
+                // SillyTavern's Options popup lives outside #sheld and is placed
+                // by Popper. The Android IME doesn't resize this WebView, so
+                // Popper otherwise keeps the old, keyboard-height position.
+                function refreshAnchoredMenus() {
+                    if (popupRefreshScheduled) return;
+                    var options = document.getElementById('options');
+                    var extensions = document.getElementById('extensionsMenu');
+                    if ((!options || getComputedStyle(options).display === 'none') &&
+                        (!extensions || getComputedStyle(extensions).display === 'none')) return;
+                    popupRefreshScheduled = true;
+                    requestAnimationFrame(function() {
+                        popupRefreshScheduled = false;
+                        window.dispatchEvent(new Event('resize'));
+                    });
+                }
+
                 function reset() {
+                    var changedShell = !!adjustedShell;
                     if (adjustedElement) {
                         adjustedElement.style.translate = originalTranslate;
                         if (composerResizeObserver) composerResizeObserver.unobserve(adjustedElement);
@@ -352,6 +370,7 @@ class MainActivity : AppCompatActivity() {
                     adjustedShell = null;
                     originalTranslate = '';
                     lastLift = 0;
+                    if (changedShell) refreshAnchoredMenus();
                 }
 
                 function positionComposer() {
@@ -359,9 +378,10 @@ class MainActivity : AppCompatActivity() {
                     var input = document.getElementById('send_textarea');
                     var bar = document.getElementById('form_sheld') ||
                               document.getElementById('send_form');
-                    var focused = input && (document.activeElement === input ||
-                                             input.contains(document.activeElement));
-                    if (!focused || !bar || !bar.isConnected || hiddenPx <= 0 ||
+                    // Keep the chat/composer lifted until the IME actually closes.
+                    // Tapping Options blurs the textarea *before* Android finishes
+                    // hiding the keyboard; resetting at blur makes the popup float.
+                    if (!bar || !bar.isConnected || hiddenPx <= 0 ||
                         viewHeightPx <= 0) {
                         reset();
                         return;
@@ -399,6 +419,7 @@ class MainActivity : AppCompatActivity() {
                             shell.style.height = nextHeight;
                             shell.style.maxHeight = nextHeight;
                             if (atBottom) chat.scrollTop = chat.scrollHeight;
+                            refreshAnchoredMenus();
                         }
                         return;
                     }
@@ -1110,7 +1131,8 @@ class MainActivity : AppCompatActivity() {
                     '}';
                 (document.head || document.documentElement).appendChild(style);
 
-                // Change only the thumb colour when pressed. Preserve its existing
+                // Colour the actual scrollbar thumb when pressed, without overlays.
+                // Preserve its existing
                 // transparent border/shape so it does not appear to get wider.
                 var pressedClass = '__kiTavernScrollbarPressed';
                 var pressedStyle = document.createElement('style');
@@ -1136,8 +1158,12 @@ class MainActivity : AppCompatActivity() {
                 // A wide horizontal tolerance remains useful on touchscreens, but
                 // a drag must start ON THE THUMB, never elsewhere in its track.
                 var grabZoneWidth = 32;
-                var thumbVerticalTolerance = 2;
-                var pressedOverlay = null;
+                // Tiny thumbs get more vertical grab tolerance; large thumbs
+                // are already easy to hit and get almost none.
+                function thumbVerticalTolerance(track, thumb) {
+                    return Math.max(2, Math.min(18,
+                        20 * (1 - thumb.height / Math.max(1, track.height))));
+                }
 
                 function setPressed(el, pressed) {
                     el.classList.toggle(pressedClass, pressed);
@@ -1159,37 +1185,6 @@ class MainActivity : AppCompatActivity() {
                     };
                 }
 
-                // Some Chromium versions defer repainting ::-webkit-scrollbar-thumb
-                // after a class change. A pointer-transparent indicator follows
-                // only the held thumb, so the blue press state remains immediate.
-                function renderPressedThumb() {
-                    if (!active || !pressedOverlay) return;
-                    var el = active.el;
-                    if (!el.isConnected) { endDrag(true); return; }
-                    var rect = active.isRoot ?
-                        {top: 0, right: innerWidth, height: innerHeight} :
-                        el.getBoundingClientRect();
-                    var blocked = el.id === 'chat' ?
-                        (parseFloat(getComputedStyle(el).getPropertyValue(
-                            '--kiTavernScrollbarBottomSpace')) || 0) : 0;
-                    var track = {el: el, top: rect.top,
-                        height: Math.max(1, rect.height - blocked)};
-                    var thumb = thumbGeometry(track);
-                    // Thumb CSS doesn't change during a drag; cache it once
-                    // instead of forcing pseudo-element style reads each frame.
-                    pressedOverlay.style.left =
-                        (rect.right - active.barWidth + active.leftInset) + 'px';
-                    pressedOverlay.style.top = (thumb.top + active.topInset) + 'px';
-                    pressedOverlay.style.width = active.visualWidth + 'px';
-                    pressedOverlay.style.height =
-                        Math.max(1, thumb.height - active.topInset - active.bottomInset) + 'px';
-                }
-
-                function removePressedOverlay() {
-                    if (pressedOverlay) pressedOverlay.remove();
-                    pressedOverlay = null;
-                }
-
                 function endDrag(cancelled) {
                     if (!active) return;
                     if (moveFrame) cancelAnimationFrame(moveFrame);
@@ -1197,7 +1192,6 @@ class MainActivity : AppCompatActivity() {
                     if (!cancelled && pendingMoveY !== null) move(pendingMoveY);
                     pendingMoveY = null;
                     setPressed(active.el, false);
-                    removePressedOverlay();
                     active = null;
                     window.__kiTavernScrollbarDragging = false;
                 }
@@ -1227,8 +1221,9 @@ class MainActivity : AppCompatActivity() {
                                 height: Math.max(1, rect.height - blocked),
                                 barWidth: barWidth, isRoot: false};
                             var thumb = thumbGeometry(track);
-                            if (y >= thumb.top - thumbVerticalTolerance &&
-                                y <= thumb.top + thumb.height + thumbVerticalTolerance) return track;
+                            var tolerance = thumbVerticalTolerance(track, thumb);
+                            if (y >= thumb.top - tolerance &&
+                                y <= thumb.top + thumb.height + tolerance) return track;
                         }
                     }
                     var root = document.scrollingElement;
@@ -1237,8 +1232,9 @@ class MainActivity : AppCompatActivity() {
                         var track = {el: root, top: 0, right: innerWidth,
                             height: innerHeight, barWidth: 12, isRoot: true};
                         var thumb = thumbGeometry(track);
-                        if (y >= thumb.top - thumbVerticalTolerance &&
-                            y <= thumb.top + thumb.height + thumbVerticalTolerance) return track;
+                        var tolerance = thumbVerticalTolerance(track, thumb);
+                        if (y >= thumb.top - tolerance &&
+                            y <= thumb.top + thumb.height + tolerance) return track;
                     }
                     return null;
                 }
@@ -1256,20 +1252,6 @@ class MainActivity : AppCompatActivity() {
                     };
                     setPressed(found.el, true);
                     window.__kiTavernScrollbarDragging = true;
-                    var cssThumb = getComputedStyle(found.el, '::-webkit-scrollbar-thumb');
-                    active.leftInset = parseFloat(cssThumb.borderLeftWidth) || 0;
-                    var rightInset = parseFloat(cssThumb.borderRightWidth) || 0;
-                    active.topInset = parseFloat(cssThumb.borderTopWidth) || 0;
-                    active.bottomInset = parseFloat(cssThumb.borderBottomWidth) || 0;
-                    active.visualWidth = Math.max(1, found.barWidth - active.leftInset - rightInset);
-                    pressedOverlay = document.createElement('div');
-                    pressedOverlay.setAttribute('aria-hidden', 'true');
-                    pressedOverlay.style.cssText =
-                        'position:fixed;pointer-events:none;z-index:2147483647;' +
-                        'background:#2196F3;box-shadow:none;display:block;';
-                    pressedOverlay.style.borderRadius = cssThumb.borderRadius || '6px';
-                    document.documentElement.appendChild(pressedOverlay);
-                    renderPressedThumb();
                     return true;
                 }
 
@@ -1285,20 +1267,12 @@ class MainActivity : AppCompatActivity() {
                         var latestY = pendingMoveY;
                         pendingMoveY = null;
                         if (latestY !== null) move(latestY);
-                        renderPressedThumb();
                     });
                 }
                 function queueMove(y) {
                     pendingMoveY = y;
                     scheduleMoveFrame();
                 }
-
-                // Also keep the blue indicator attached if page JS scrolls the
-                // same container while the finger is down.
-                document.addEventListener('scroll', function(e) {
-                    if (active && (e.target === active.el ||
-                        (active.isRoot && e.target === document))) scheduleMoveFrame();
-                }, true);
 
                 // Touch listeners, rather than only pointer capture, are important on
                 // Android: native panning can cancel the pointer event stream.
