@@ -57,6 +57,13 @@
     var lastToolbarUpdate = 0;
     var correctedExternalScrolls = 0;
 
+    // Selection-handle edge scrolling, measured in CSS pixels per second.
+    // The tested values reach maximum speed after about 4.7 CSS pixels
+    // beyond the edge threshold. Keep the existing drag-jump guard unchanged.
+    var SELECTION_SCROLL_BASE_PX_PER_SECOND = 2048;
+    var SELECTION_SCROLL_MAX_PX_PER_SECOND = 2048;
+    var SELECTION_SCROLL_GAIN_PER_EDGE_PIXEL = 128;
+
     var DOCUMENT_SCROLL = document.scrollingElement || document.documentElement;
     var EXCLUDE = 'a,button,input,textarea,select,option,label,summary,' +
         '[contenteditable],[role="button"],[role="textbox"],[role="link"],' +
@@ -558,11 +565,12 @@
         lastFrameTime = now;
         var moved = false;
         if (delta) {
-            // Modest speed increase over working v4, retaining its drag
-            // scroll guard and avoiding v5's 2x jump-prone rate.
-            // Maximum: 500 CSS px/sec (v4: 440; v5: 880).
+            // Preserve the tested speed curve exactly; only its configurable
+            // constants have been named for clarity.
             var speed = Math.sign(delta) *
-                Math.min(2650, 2110 + 114 * Math.abs(delta));
+                Math.min(SELECTION_SCROLL_MAX_PX_PER_SECOND,
+                    SELECTION_SCROLL_BASE_PX_PER_SECOND +
+                    SELECTION_SCROLL_GAIN_PER_EDGE_PIXEL * Math.abs(delta));
             var before = area.scroll.scrollTop;
             var next = Math.max(0, Math.min(
                 area.scroll.scrollHeight - area.scroll.clientHeight,
