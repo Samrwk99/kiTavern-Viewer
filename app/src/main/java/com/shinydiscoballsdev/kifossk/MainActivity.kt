@@ -165,8 +165,64 @@ class MainActivity : AppCompatActivity() {
      */
     private fun configureKeyboardInsets() {
         @Suppress("DEPRECATION")
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN)
+        updateKeyboardStartupMode()
         WindowCompat.setDecorFitsSystemWindows(window, false)
+    }
+
+    /** Keep Android's initial IME state hidden when chat auto-focus is disabled. */
+    private fun updateKeyboardStartupMode() {
+        val state = if (KioskPrefs.getAutoFocusChatInput(this)) 0 else
+            WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+        @Suppress("DEPRECATION")
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or state)
+    }
+
+    /** SillyTavern focuses #send_textarea programmatically on chat changes.
+     *  Ignore that automatic focus only when the setting is off; explicit taps
+     *  on the composer still focus it normally. Other websites are untouched.
+     */
+    private fun updateChatFocusPolicy(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        val autoFocus = KioskPrefs.getAutoFocusChatInput(this)
+        target.evaluateJavascript(
+            """
+            (function() {
+                var state = window.__kiTavernFocusPolicy;
+                if (!state) {
+                    state = {autoFocus: true, allowedUntil: 0};
+                    window.__kiTavernFocusPolicy = state;
+                    function isComposer(el) {
+                        return el && el.nodeType === 1 &&
+                            (el.id === 'send_textarea' ||
+                             (el.closest && el.closest('#send_textarea')));
+                    }
+                    // Only an actual interaction with the composer opts in to
+                    // keyboard focus. Clicking a message/chat elsewhere doesn't.
+                    function allowUserFocus(e) {
+                        if (isComposer(e.target))
+                            state.allowedUntil = performance.now() + 1600;
+                    }
+                    document.addEventListener('pointerdown', allowUserFocus, true);
+                    document.addEventListener('touchstart', allowUserFocus, true);
+                    document.addEventListener('mousedown', allowUserFocus, true);
+                    document.addEventListener('focusin', function(e) {
+                        if (!state.autoFocus && isComposer(e.target) &&
+                            performance.now() > state.allowedUntil) {
+                            e.target.blur();
+                        }
+                    }, true);
+                }
+                state.autoFocus = $autoFocus;
+                if (!state.autoFocus && document.activeElement &&
+                    (document.activeElement.id === 'send_textarea' ||
+                     (document.activeElement.closest &&
+                      document.activeElement.closest('#send_textarea'))) &&
+                    performance.now() > state.allowedUntil) {
+                    document.activeElement.blur();
+                }
+            })();
+            """.trimIndent(), null
+        )
     }
 
     private fun installKeyboardInsetsListener() {
@@ -419,6 +475,9 @@ class MainActivity : AppCompatActivity() {
         }
         if (requestedOrientation != wantedOrientation) requestedOrientation = wantedOrientation
 
+        updateKeyboardStartupMode()
+        if (::webView.isInitialized) updateChatFocusPolicy(webView)
+
         if (KioskPrefs.getScreenOn(this)) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
@@ -506,6 +565,7 @@ class MainActivity : AppCompatActivity() {
         // A retained/restored WebView may never fire onPageFinished again.
         webView.post {
             installKeyboardLift(webView)
+            updateChatFocusPolicy(webView)
             installScrollbarDrag(webView)
             installChatTextSelection(webView)
         }
@@ -702,6 +762,7 @@ class MainActivity : AppCompatActivity() {
                 if (view != null) {
                     injectBlobInterceptor(view)
                     installKeyboardLift(view)
+                    updateChatFocusPolicy(view)
                     installScrollbarDrag(view)
                     installChatTextSelection(view)
                     installDebugHeartbeat(view)
@@ -1031,6 +1092,8 @@ class MainActivity : AppCompatActivity() {
                 window.__kiTavernScrollbarDragInstalled = true;
 
                 var active = null;
+                var moveFrame = 0;
+                var pendingMoveY = null;
                 // Keep the chosen visible width separate from the larger touch target.
                 var style = document.createElement('style');
                 style.textContent =
@@ -1052,7 +1115,12 @@ class MainActivity : AppCompatActivity() {
                 var pressedClass = '__kiTavernScrollbarPressed';
                 var pressedStyle = document.createElement('style');
                 pressedStyle.textContent =
-                    '.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb {' +
+                    // Control blue only with our own drag class. Chromium's
+                    // scrollbar-thumb:active may remain active after touchend,
+                    // leaving the thumb permanently blue on some devices.
+                    // Higher specificity preserves the pressed colour over themes.
+                    '#chat.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb,' +
+                    '.__kiTavernScrollbarPressed.__kiTavernScrollbarPressed::-webkit-scrollbar-thumb {' +
                     'background-color: #2196F3 !important;' +
                     'background-clip: padding-box !important;' +
                     'background-image: none !important;' +
@@ -1065,9 +1133,11 @@ class MainActivity : AppCompatActivity() {
                     '}';
                 (document.head || document.documentElement).appendChild(pressedStyle);
 
-                // A wider invisible grab zone makes narrow scrollbars easier to touch
-                // without changing their appearance or the webpage layout.
+                // A wide horizontal tolerance remains useful on touchscreens, but
+                // a drag must start ON THE THUMB, never elsewhere in its track.
                 var grabZoneWidth = 32;
+                var thumbVerticalTolerance = 2;
+                var pressedOverlay = null;
 
                 function setPressed(el, pressed) {
                     el.classList.toggle(pressedClass, pressed);
@@ -1076,18 +1146,70 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                function endDrag() {
+                function thumbGeometry(track) {
+                    var el = track.el;
+                    var range = Math.max(0, el.scrollHeight - el.clientHeight);
+                    var height = Math.min(track.height,
+                        Math.max(24, track.height * el.clientHeight / el.scrollHeight));
+                    var travel = Math.max(0, track.height - height);
+                    return {
+                        top: track.top + (range ?
+                            Math.max(0, Math.min(range, el.scrollTop)) / range * travel : 0),
+                        height: height, range: range, travel: travel
+                    };
+                }
+
+                // Some Chromium versions defer repainting ::-webkit-scrollbar-thumb
+                // after a class change. A pointer-transparent indicator follows
+                // only the held thumb, so the blue press state remains immediate.
+                function renderPressedThumb() {
+                    if (!active || !pressedOverlay) return;
+                    var el = active.el;
+                    if (!el.isConnected) { endDrag(true); return; }
+                    var rect = active.isRoot ?
+                        {top: 0, right: innerWidth, height: innerHeight} :
+                        el.getBoundingClientRect();
+                    var blocked = el.id === 'chat' ?
+                        (parseFloat(getComputedStyle(el).getPropertyValue(
+                            '--kiTavernScrollbarBottomSpace')) || 0) : 0;
+                    var track = {el: el, top: rect.top,
+                        height: Math.max(1, rect.height - blocked)};
+                    var thumb = thumbGeometry(track);
+                    // Thumb CSS doesn't change during a drag; cache it once
+                    // instead of forcing pseudo-element style reads each frame.
+                    pressedOverlay.style.left =
+                        (rect.right - active.barWidth + active.leftInset) + 'px';
+                    pressedOverlay.style.top = (thumb.top + active.topInset) + 'px';
+                    pressedOverlay.style.width = active.visualWidth + 'px';
+                    pressedOverlay.style.height =
+                        Math.max(1, thumb.height - active.topInset - active.bottomInset) + 'px';
+                }
+
+                function removePressedOverlay() {
+                    if (pressedOverlay) pressedOverlay.remove();
+                    pressedOverlay = null;
+                }
+
+                function endDrag(cancelled) {
                     if (!active) return;
+                    if (moveFrame) cancelAnimationFrame(moveFrame);
+                    moveFrame = 0;
+                    if (!cancelled && pendingMoveY !== null) move(pendingMoveY);
+                    pendingMoveY = null;
                     setPressed(active.el, false);
+                    removePressedOverlay();
                     active = null;
+                    window.__kiTavernScrollbarDragging = false;
                 }
 
                 function findScrollbar(x, y) {
-                    // Include scrollable panels, not just the page's main scrollbar.
                     var elements = document.elementsFromPoint(x, y);
+                    var checked = new Set();
                     for (var i = 0; i < elements.length; i++) {
                         for (var el = elements[i]; el && el.nodeType === 1;
                              el = el.parentElement) {
+                            if (checked.has(el)) continue;
+                            checked.add(el);
                             if (el === document.body || el === document.documentElement) continue;
                             var rect = el.getBoundingClientRect();
                             if (y < rect.top || y > rect.bottom || x > rect.right) continue;
@@ -1100,16 +1222,23 @@ class MainActivity : AppCompatActivity() {
                             var blocked = el.id === 'chat' ?
                                 (parseFloat(style.getPropertyValue('--kiTavernScrollbarBottomSpace')) || 0) : 0;
                             if (y > rect.bottom - blocked) continue;
-                            if (x >= rect.right - Math.max(grabZoneWidth, barWidth + 4)) {
-                                return {el: el, top: rect.top,
-                                    height: Math.max(1, rect.height - blocked)};
-                            }
+                            if (x < rect.right - Math.max(grabZoneWidth, barWidth + 4)) continue;
+                            var track = {el: el, top: rect.top, right: rect.right,
+                                height: Math.max(1, rect.height - blocked),
+                                barWidth: barWidth, isRoot: false};
+                            var thumb = thumbGeometry(track);
+                            if (y >= thumb.top - thumbVerticalTolerance &&
+                                y <= thumb.top + thumb.height + thumbVerticalTolerance) return track;
                         }
                     }
                     var root = document.scrollingElement;
                     if (root && root.scrollHeight > root.clientHeight + 1 &&
                         x >= innerWidth - grabZoneWidth) {
-                        return {el: root, top: 0, height: innerHeight};
+                        var track = {el: root, top: 0, right: innerWidth,
+                            height: innerHeight, barWidth: 12, isRoot: true};
+                        var thumb = thumbGeometry(track);
+                        if (y >= thumb.top - thumbVerticalTolerance &&
+                            y <= thumb.top + thumb.height + thumbVerticalTolerance) return track;
                     }
                     return null;
                 }
@@ -1118,15 +1247,29 @@ class MainActivity : AppCompatActivity() {
                     if (active) return false;
                     var found = findScrollbar(x, y);
                     if (!found) return false;
-                    var el = found.el;
-                    var range = el.scrollHeight - el.clientHeight;
-                    // Match thumb motion to the available scrollbar travel distance.
-                    var thumb = Math.max(24, found.height * el.clientHeight / el.scrollHeight);
+                    var thumb = thumbGeometry(found);
                     active = {
-                        id: id, kind: kind, el: el, y: y, start: el.scrollTop,
-                        travel: Math.max(1, found.height - thumb), range: range
+                        id: id, kind: kind, el: found.el, y: y,
+                        start: found.el.scrollTop, travel: Math.max(1, thumb.travel),
+                        range: thumb.range, isRoot: found.isRoot,
+                        barWidth: found.barWidth
                     };
-                    setPressed(el, true);
+                    setPressed(found.el, true);
+                    window.__kiTavernScrollbarDragging = true;
+                    var cssThumb = getComputedStyle(found.el, '::-webkit-scrollbar-thumb');
+                    active.leftInset = parseFloat(cssThumb.borderLeftWidth) || 0;
+                    var rightInset = parseFloat(cssThumb.borderRightWidth) || 0;
+                    active.topInset = parseFloat(cssThumb.borderTopWidth) || 0;
+                    active.bottomInset = parseFloat(cssThumb.borderBottomWidth) || 0;
+                    active.visualWidth = Math.max(1, found.barWidth - active.leftInset - rightInset);
+                    pressedOverlay = document.createElement('div');
+                    pressedOverlay.setAttribute('aria-hidden', 'true');
+                    pressedOverlay.style.cssText =
+                        'position:fixed;pointer-events:none;z-index:2147483647;' +
+                        'background:#2196F3;box-shadow:none;display:block;';
+                    pressedOverlay.style.borderRadius = cssThumb.borderRadius || '6px';
+                    document.documentElement.appendChild(pressedOverlay);
+                    renderPressedThumb();
                     return true;
                 }
 
@@ -1135,10 +1278,33 @@ class MainActivity : AppCompatActivity() {
                     active.el.scrollTop = active.start +
                         (y - active.y) * active.range / active.travel;
                 }
+                function scheduleMoveFrame() {
+                    if (moveFrame) return;
+                    moveFrame = requestAnimationFrame(function () {
+                        moveFrame = 0;
+                        var latestY = pendingMoveY;
+                        pendingMoveY = null;
+                        if (latestY !== null) move(latestY);
+                        renderPressedThumb();
+                    });
+                }
+                function queueMove(y) {
+                    pendingMoveY = y;
+                    scheduleMoveFrame();
+                }
+
+                // Also keep the blue indicator attached if page JS scrolls the
+                // same container while the finger is down.
+                document.addEventListener('scroll', function(e) {
+                    if (active && (e.target === active.el ||
+                        (active.isRoot && e.target === document))) scheduleMoveFrame();
+                }, true);
 
                 // Touch listeners, rather than only pointer capture, are important on
                 // Android: native panning can cancel the pointer event stream.
                 document.addEventListener('touchstart', function(e) {
+                    // A second finger interrupts a single-finger scrollbar drag.
+                    if (active && e.touches.length !== 1) endDrag(true);
                     if (e.touches.length !== 1 ||
                         (e.target.closest && e.target.closest('.ki-chat-select-control'))) return;
                     var t = e.changedTouches[0];
@@ -1153,7 +1319,7 @@ class MainActivity : AppCompatActivity() {
                         var t = e.changedTouches[i];
                         if (t.identifier === active.id) {
                             e.preventDefault();
-                            move(t.clientY);
+                            queueMove(t.clientY);
                             break;
                         }
                     }
@@ -1163,13 +1329,20 @@ class MainActivity : AppCompatActivity() {
                     if (!active || active.kind !== 'touch') return;
                     for (var i = 0; i < e.changedTouches.length; i++) {
                         if (e.changedTouches[i].identifier === active.id) {
-                            endDrag();
+                            endDrag(e.type === 'touchcancel');
                             break;
                         }
                     }
                 }
                 document.addEventListener('touchend', touchEnd, true);
                 document.addEventListener('touchcancel', touchEnd, true);
+                // Some Android WebViews swallow the matching touchend when a
+                // native scrollbar takes ownership of the gesture. In that case
+                // the corresponding touch pointerup still ends our pressed state.
+                document.addEventListener('pointerup', function(e) {
+                    if (active && active.kind === 'touch' && e.pointerType === 'touch')
+                        endDrag(false);
+                }, true);
 
                 // Keep the same behaviour for a mouse or stylus dragging a thumb.
                 document.addEventListener('pointerdown', function(e) {
@@ -1184,7 +1357,7 @@ class MainActivity : AppCompatActivity() {
                     if (!active || active.kind !== 'pointer' || e.pointerId !== active.id)
                         return;
                     e.preventDefault();
-                    move(e.clientY);
+                    queueMove(e.clientY);
                 }, true);
                 function pointerEnd(e) {
                     if (active && active.kind === 'pointer' && e.pointerId === active.id)
@@ -1192,7 +1365,17 @@ class MainActivity : AppCompatActivity() {
                 }
                 document.addEventListener('pointerup', pointerEnd, true);
                 document.addEventListener('pointercancel', pointerEnd, true);
-                window.addEventListener('blur', endDrag);
+                // If the browser loses a gesture or the app backgrounds, always
+                // clear its pressed class and discard any pending drag frame.
+                document.addEventListener('lostpointercapture', function(e) {
+                    if (active && active.kind === 'pointer' && e.pointerId === active.id)
+                        endDrag(true);
+                }, true);
+                document.addEventListener('visibilitychange', function() {
+                    if (document.hidden) endDrag(true);
+                });
+                window.addEventListener('pagehide', function() { endDrag(true); });
+                window.addEventListener('blur', function() { endDrag(true); });
             })();
             """.trimIndent(), null
         )

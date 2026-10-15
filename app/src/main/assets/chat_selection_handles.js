@@ -10,6 +10,12 @@
     window.__kiTavernChatHandlesInstalled = true;
 
     var STYLE = '__kiChatSelectionCSS';
+    var HIGHLIGHT_NAME = '__kiTavernSelectedText';
+    // Let Chromium paint the exact text range once. The old rectangle overlay
+    // can double-paint paragraphs with nested inline/block markup.
+    var USE_NATIVE_HIGHLIGHT = !!(window.CSS && CSS.highlights &&
+        typeof window.Highlight === 'function' &&
+        (!CSS.supports || CSS.supports('selector(::highlight(' + HIGHLIGHT_NAME + '))')));
     var TOUCH_LOCK = '__kiChatSelectionTouchLock';
     var HANDLE_CLASS = 'ki-chat-select-control';
     var style = document.createElement('style');
@@ -31,6 +37,7 @@
         '#chat input, #chat textarea, #chat [contenteditable], ' +
         '#chat [contenteditable] * {' +
         '-webkit-user-select:text!important;user-select:text!important;}' +
+        '::highlight(' + HIGHLIGHT_NAME + '){background-color:rgba(33,150,243,.30);}' +
         '#__kiChatSelectOverlay{position:fixed;inset:0;z-index:2147483640;' +
         'pointer-events:none;font-family:Roboto,Arial,sans-serif;}' +
         '#__kiChatSelectOverlay .ki-chat-select-mark{position:fixed;' +
@@ -281,6 +288,7 @@
         var previous = session;
         previous.area.scroll.removeEventListener('scroll', onSelectionScroll);
         if (previous.overlay.parentNode) previous.overlay.remove();
+        if (previous.nativeHighlight) CSS.highlights.delete(HIGHLIGHT_NAME);
         session = null;
         unlock(previous.area);
     }
@@ -470,6 +478,12 @@
         var ui = buildOverlay();
         session = Object.assign({area:area, start:pair.start, end:pair.end,
             waitingForRelease:touchId, nativeToolbarVisible:false}, ui);
+        if (USE_NATIVE_HIGHLIGHT) {
+            try {
+                session.nativeHighlight = new Highlight();
+                CSS.highlights.set(HIGHLIGHT_NAME, session.nativeHighlight);
+            } catch (_) { session.nativeHighlight = null; }
+        }
         // Don't show the toolbar underneath the initiating long-press finger.
         // The native toolbar appears after the initiating press is released.
         area.scroll.addEventListener('scroll', onSelectionScroll, {passive:true});
@@ -502,26 +516,62 @@
         if (!r) { closeSelection(); return; }
         var box = viewportBox(area);
         if (box.width < 20 || box.height < 20) { closeSelection(); return; }
-        var rectangles = r.getClientRects();
-        var frag = document.createDocumentFragment();
-        var count = 0;
-        for (var i = 0; i < rectangles.length && count < 220; i++) {
-            var item = rectangles[i];
-            if (!item.width || !item.height || item.bottom <= box.top ||
-                item.top >= box.bottom || item.right <= box.left || item.left >= box.right) continue;
-            var left = Math.max(box.left, item.left), top = Math.max(box.top, item.top);
-            var right = Math.min(box.right, item.right);
-            var bottom = Math.min(box.bottom, item.bottom);
-            if (right <= left || bottom <= top) continue;
-            var mark = make('div', 'ki-chat-select-mark');
-            mark.style.left = left + 'px';
-            mark.style.top = top + 'px';
-            mark.style.width = (right - left) + 'px';
-            mark.style.height = (bottom - top) + 'px';
-            frag.appendChild(mark);
-            count++;
+        if (session.nativeHighlight) {
+            // Only update the highlight when the endpoints change. Scroll alone
+            // moves the native highlight automatically; no per-frame DOM churn.
+            var last = session.lastPaintedRange;
+            if (!last || last.startNode !== session.start.node ||
+                last.startOffset !== session.start.offset ||
+                last.endNode !== session.end.node ||
+                last.endOffset !== session.end.offset) {
+                session.nativeHighlight.clear();
+                session.nativeHighlight.add(r);
+                session.lastPaintedRange = {
+                    startNode:session.start.node, startOffset:session.start.offset,
+                    endNode:session.end.node, endOffset:session.end.offset
+                };
+            }
+        } else {
+            // Old WebView fallback. Range.getClientRects() can include both a
+            // paragraph's box and its nested text boxes: discard overlapping
+            // parent/equal boxes rather than stacking translucent rectangles.
+            var rectangles = r.getClientRects();
+            var candidates = [];
+            for (var i = 0; i < rectangles.length && candidates.length < 300; i++) {
+                var item = rectangles[i];
+                if (!item.width || !item.height || item.bottom <= box.top ||
+                    item.top >= box.bottom || item.right <= box.left || item.left >= box.right)
+                    continue;
+                var left = Math.max(box.left, item.left), top = Math.max(box.top, item.top);
+                var right = Math.min(box.right, item.right);
+                var bottom = Math.min(box.bottom, item.bottom);
+                if (right > left && bottom > top)
+                    candidates.push({left:left, top:top, right:right, bottom:bottom});
+            }
+            var frag = document.createDocumentFragment();
+            var count = 0;
+            for (var a = 0; a < candidates.length && count < 220; a++) {
+                var outer = candidates[a], redundant = false;
+                for (var b = 0; b < candidates.length; b++) {
+                    if (a === b) continue;
+                    var inner = candidates[b];
+                    if (inner.left >= outer.left - .5 && inner.right <= outer.right + .5 &&
+                        inner.top >= outer.top - .5 && inner.bottom <= outer.bottom + .5 &&
+                        (inner.left > outer.left + .5 || inner.right < outer.right - .5 ||
+                         inner.top > outer.top + .5 || inner.bottom < outer.bottom - .5 ||
+                         b < a)) { redundant = true; break; }
+                }
+                if (redundant) continue;
+                var mark = make('div', 'ki-chat-select-mark');
+                mark.style.left = outer.left + 'px';
+                mark.style.top = outer.top + 'px';
+                mark.style.width = (outer.right - outer.left) + 'px';
+                mark.style.height = (outer.bottom - outer.top) + 'px';
+                frag.appendChild(mark);
+                count++;
+            }
+            session.marks.replaceChildren(frag);
         }
-        session.marks.replaceChildren(frag);
         showHandle(session.handles[0], session.start, box);
         showHandle(session.handles[1], session.end, box);
         // The native toolbar stays anchored during normal scrolling; moving its
@@ -573,6 +623,21 @@
         stopFrame();
         beginDragScrollLock();
         frame = requestAnimationFrame(dragTick);
+    }
+    function swapHandleSides(newSide) {
+        if (!drag || !session || drag.side === newSide) return;
+        // Reassign the DOM handles as well as the endpoints: the handle still
+        // underneath the finger must keep moving after it crosses the other.
+        var handles = session.handles;
+        var oldStart = handles[0];
+        handles[0] = handles[1];
+        handles[1] = oldStart;
+        handles[0].dataset.side = 'start';
+        handles[1].dataset.side = 'end';
+        handles[0].setAttribute('aria-label', 'Selection start');
+        handles[1].setAttribute('aria-label', 'Selection end');
+        drag.side = newSide;
+        session.lastMovedSide = newSide;
     }
     function dragTick(now) {
         frame = 0;
@@ -640,12 +705,20 @@
         var pt = fromXY(area, drag.x, drag.y);
         if (pt) {
             try {
+                // Keep start <= end, but let the *finger-owned handle* pass the
+                // stationary endpoint. It switches roles rather than collapsing
+                // and disappearing when dragging a selection backwards.
                 if (drag.side === 'start' && compare(pt, session.end) < 0) {
-                    pt = session.end;
+                    session.start = session.end;
+                    session.end = pt;
+                    swapHandleSides('end');
                 } else if (drag.side === 'end' && compare(session.start, pt) < 0) {
-                    pt = session.start;
+                    session.end = session.start;
+                    session.start = pt;
+                    swapHandleSides('start');
+                } else {
+                    session[drag.side] = pt;
                 }
-                session[drag.side] = pt;
             } catch (_) { /* Content re-rendered underneath us. */ }
         }
         draw();
@@ -723,7 +796,8 @@
 
     document.addEventListener('touchstart', function (e) {
         if (e.touches.length !== 1) { stopPending(); tapCandidate = null; return; }
-        if (drag || (e.target.closest && e.target.closest('.' + HANDLE_CLASS))) return;
+        if (drag || window.__kiTavernScrollbarDragging ||
+            (e.target.closest && e.target.closest('.' + HANDLE_CLASS))) return;
         stopPending();
         var t = e.changedTouches[0];
         var area = eligible(e.target, t.clientX, t.clientY);

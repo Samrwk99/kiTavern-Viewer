@@ -60,6 +60,10 @@ object KioskPrefs {
         getInstance(context).edit().putString("app_theme", safe).apply()
     }
 
+    /** Preserve the existing behaviour unless the user explicitly disables it. */
+    fun getAutoFocusChatInput(context: Context): Boolean =
+        getInstance(context).getBoolean("auto_focus_chat_input", true)
+
     /** Store a settings snapshot with one apply() instead of several disk writes. */
     fun saveSettings(
         context: Context,
@@ -67,6 +71,7 @@ object KioskPrefs {
         screenOn: Boolean,
         keepAlive: Boolean,
         showNotification: Boolean,
+        autoFocusChatInput: Boolean,
         orientation: String,
         theme: String
     ) {
@@ -92,6 +97,7 @@ object KioskPrefs {
         putBoolean("screen_on", screenOn, false)
         putBoolean("keep_alive", keepAlive, true)
         putBoolean("show_notification", showNotification, true)
+        putBoolean("auto_focus_chat_input", autoFocusChatInput, true)
         putString("orientation", safeOrientation)
         putString("app_theme", safeTheme)
         if (changed) editor.apply()
