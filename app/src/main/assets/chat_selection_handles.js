@@ -75,6 +75,12 @@
     var correctedExternalScrolls = 0;
     var recentFieldTouch = null;
     var fieldSelectReentry = false;
+    // During an ordinary scroll, move handles by the scroll offset rather than
+    // repeatedly querying DOM Range geometry while Chromium is compositing.
+    // After scrolling settles, snap back to the real text endpoints once.
+    var motionFrame = 0;
+    var motionSettleTimer = null;
+    var motionActive = false;
 
     // Start at 850 px/s, reaching 2048 px/s after 2 seconds.
     // Continue to 4096 px/s at 4 seconds, then apply a configurable
@@ -198,6 +204,96 @@
         frame = 0;
         lastFrameTime = 0;
     }
+    // Snapshot every scrolling ancestor, not just #chat. This covers popup
+    // panes and whole-page scrolling without changing their DOM/CSS layout.
+    function scrollSnapshot(area) {
+        var values = [];
+        var seen = [];
+        for (var el = area.root; el; el = el.parentElement) {
+            if (el === document.documentElement) break;
+            values.push({el:el, top:el.scrollTop, left:el.scrollLeft});
+            seen.push(el);
+        }
+        var rootScroller = document.scrollingElement || document.documentElement;
+        if (seen.indexOf(rootScroller) < 0)
+            values.push({el:rootScroller, top:rootScroller.scrollTop,
+                left:rootScroller.scrollLeft});
+        return values;
+    }
+    function recordHandlePositions() {
+        if (!session) return;
+        session.handlePositionSnapshot = {
+            scrolls:scrollSnapshot(session.area),
+            handles:session.handles.map(function (handle) {
+                return {left:parseFloat(handle.style.left) || 0,
+                    top:parseFloat(handle.style.top) || 0,
+                    visible:handle.style.display !== 'none'};
+            })
+        };
+    }
+    function cancelMotion(keepVisualPosition) {
+        if (motionFrame) cancelAnimationFrame(motionFrame);
+        if (motionSettleTimer) clearTimeout(motionSettleTimer);
+        motionFrame = 0;
+        motionSettleTimer = null;
+        motionActive = false;
+        if (!session) return;
+        // Keep the composited offset until the next draw; clearing it first
+        // would flash the handle at its old, pre-scroll position for a frame.
+        if (!keepVisualPosition)
+            session.handles.forEach(function (handle) { handle.style.transform = ''; });
+        session.marks.style.visibility = '';
+    }
+    function motionTick() {
+        motionFrame = 0;
+        if (!session || drag || !motionActive) return;
+        var base = session.handlePositionSnapshot;
+        if (!base) return;
+        var dx = 0, dy = 0;
+        base.scrolls.forEach(function (s) {
+            if (!s.el.isConnected) return;
+            dx += s.el.scrollLeft - s.left;
+            dy += s.el.scrollTop - s.top;
+        });
+        // Translate the fixed-position controls through compositor-friendly
+        // transforms. The text's true Range rectangles can lag for a frame or
+        // two during native flings, so don't sample them until the scroll stops.
+        var box = viewportBox(session.area);
+        base.handles.forEach(function (p, i) {
+            var handle = session.handles[i];
+            if (!p.visible || p.top - dy + 37 < box.top ||
+                p.top - dy > box.bottom || p.left - dx < box.left - 20 ||
+                p.left - dx > box.right + 20) {
+                handle.style.display = 'none';
+                return;
+            }
+            handle.style.display = 'block';
+            handle.style.transform = 'translate3d(' + (-dx) + 'px,' + (-dy) + 'px,0)';
+        });
+        // On older WebViews, rectangle highlights aren't tied to content.
+        // Hide those transient overlays rather than show misplaced highlights.
+        if (!session.nativeHighlight) session.marks.style.visibility = 'hidden';
+        if (session.area.field && session.mirror) {
+            session.mirror.scrollTop = session.area.field.scrollTop;
+            session.mirror.scrollLeft = session.area.field.scrollLeft;
+        }
+    }
+    function beginMotion() {
+        if (!session || drag) return;
+        if (!session.handlePositionSnapshot) {
+            scheduleDraw();
+            return;
+        }
+        motionActive = true;
+        if (!motionFrame) motionFrame = requestAnimationFrame(motionTick);
+        if (motionSettleTimer) clearTimeout(motionSettleTimer);
+        motionSettleTimer = setTimeout(function () {
+            motionSettleTimer = null;
+            if (!session || drag) { cancelMotion(); return; }
+            cancelMotion(true);
+            scheduleDraw();
+        }, 110);
+    }
     // While a custom handle is held, the WebView's built-in scroll handling,
     // scroll anchoring and a page's smooth-scroll CSS must not compete with
     // the incremental selection scroll. This lock only exists during a drag.
@@ -319,12 +415,15 @@
     }
     function closeSelection() {
         hideToolbar();
+        cancelMotion();
         stopFrame();
         restoreDragScrollLock(drag);
         drag = null;
         if (!session) return;
         var previous = session;
         previous.area.scroll.removeEventListener('scroll', onSelectionScroll);
+        if (previous.resizeObserver) previous.resizeObserver.disconnect();
+        if (previous.layoutObserver) previous.layoutObserver.disconnect();
         if (previous.overlay.parentNode) previous.overlay.remove();
         if (previous.nativeHighlight) CSS.highlights.delete(HIGHLIGHT_NAME);
         if (previous.area.field) previous.area.field.classList.remove('__kiFieldSelectActive');
@@ -643,9 +742,33 @@
         // The native toolbar appears after the initiating press is released.
         area.scroll.addEventListener('scroll', onSelectionScroll, {passive:true});
         lock(area);
+        observeSelectionLayout(session);
         scheduleDraw();
     }
+    function observeSelectionLayout(current) {
+        // Selection endpoints can also move because images load, a message
+        // streams in, or settings resize. Watch only the selected region while
+        // selection exists, and realign once those layout changes settle.
+        if (typeof ResizeObserver === 'function') {
+            current.resizeObserver = new ResizeObserver(function () {
+                if (session === current && !drag) beginMotion();
+            });
+            current.resizeObserver.observe(current.area.root);
+            if (current.area.scroll !== current.area.root)
+                current.resizeObserver.observe(current.area.scroll);
+        }
+        if (typeof MutationObserver === 'function') {
+            current.layoutObserver = new MutationObserver(function () {
+                if (session === current && !drag) beginMotion();
+            });
+            current.layoutObserver.observe(current.area.root, {
+                subtree:true, childList:true, characterData:true, attributes:true,
+                attributeFilter:['class', 'style', 'hidden']
+            });
+        }
+    }
     function showHandle(handle, point, box) {
+        handle.style.transform = '';
         var rect = pointRect(point);
         if (!rect || rect.bottom < box.top || rect.top > box.bottom ||
             rect.right < box.left || rect.left > box.right) {
@@ -733,12 +856,14 @@
         }
         showHandle(session.handles[0], session.start, box);
         showHandle(session.handles[1], session.end, box);
+        recordHandlePositions();
         // The native toolbar stays anchored during normal scrolling; moving its
         // content rect every animation frame can disrupt WebView touch handling.
     }
     function scheduleDraw() {
-        // The drag loop already draws every frame while scrolling.
-        if (drag) return;
+        // Neither drag scrolling nor native kinetic scrolling should trigger
+        // competing Range measurements on every frame.
+        if (drag || motionActive) return;
         if (session && !frame) frame = requestAnimationFrame(function () {
             frame = 0;
             draw();
@@ -746,7 +871,7 @@
     }
     function onSelectionScroll() {
         if (drag) guardDragScroll();
-        scheduleDraw();
+        else beginMotion();
         if (!session || drag || !session.nativeToolbarVisible) return;
         // Only reposition a native popup after a scroll gesture settles.
         // Updating ActionMode every frame was disrupting selection gestures.
@@ -760,6 +885,7 @@
         if (!session || e.touches.length !== 1) return;
         e.preventDefault();
         e.stopPropagation();
+        cancelMotion(true);
         var t = e.changedTouches[0];
         hideToolbar();
         session.lastMovedSide = e.currentTarget.dataset.side;
@@ -774,6 +900,7 @@
         if (e.pointerType === 'touch' || e.button !== 0 || !session) return;
         e.preventDefault();
         e.stopPropagation();
+        cancelMotion(true);
         hideToolbar();
         session.lastMovedSide = e.currentTarget.dataset.side;
         drag = {side:e.currentTarget.dataset.side, id:e.pointerId,
@@ -1108,12 +1235,14 @@
     }, true);
     window.addEventListener('scroll', function () {
         if (drag) guardDragScroll();
-        scheduleDraw();
+        else beginMotion();
     }, true);
-    window.addEventListener('resize', scheduleDraw);
+    // Keyboard/visual-viewport transitions also change content geometry.
+    // Debounce their Range measurements until the layout has settled.
+    window.addEventListener('resize', beginMotion);
     if (window.visualViewport) {
-        window.visualViewport.addEventListener('resize', scheduleDraw);
-        window.visualViewport.addEventListener('scroll', scheduleDraw);
+        window.visualViewport.addEventListener('resize', beginMotion);
+        window.visualViewport.addEventListener('scroll', beginMotion);
     }
     // A floating Android ActionMode can move window focus temporarily.
     // Losing focus must not discard the selected range or its handles.
