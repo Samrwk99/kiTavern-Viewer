@@ -50,6 +50,7 @@ import java.net.URLEncoder
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
+    private val selectionToolbar by lazy { SelectionToolbar(this) }
     private lateinit var container: FrameLayout
     private var settingsFragment: SettingsFragment? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -146,6 +147,7 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                if (selectionToolbar.dismissOnBack()) return
                 if (settingsFragment != null) closeSettings() else showSettings()
             }
         })
@@ -505,6 +507,7 @@ class MainActivity : AppCompatActivity() {
         webView.post {
             installKeyboardLift(webView)
             installScrollbarDrag(webView)
+            installChatTextSelection(webView)
         }
 
         // If this is a configuration/recreation hand-off, keep the same WebView object
@@ -591,6 +594,80 @@ class MainActivity : AppCompatActivity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
         view.addJavascriptInterface(blobDownloader, "BlobDownloader")
+        selectionToolbar.attach(view)
+
+        // Resolve whether this press is on selectable page text *before* Android's
+        // long-click callback. Returning true for that gesture prevents Chromium
+        // from starting a second, competing set of native selection handles.
+        // Links, input fields and unknown/unready pages retain normal behaviour.
+        val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        var gestureSequence = 0
+        var downX = -1f
+        var downY = -1f
+        var customLongPressEligible = false
+        var customLongPressInProgress = false
+        view.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    customLongPressInProgress = false
+                    downX = event.x
+                    downY = event.y
+                    customLongPressEligible = false
+                    val sequence = ++gestureSequence
+                    if (UrlValidator.isValid(view.url) && view.width > 0 && view.height > 0) {
+                        val script = "window.__kiTavernChatSelect ? " +
+                            "window.__kiTavernChatSelect.probeAt(" +
+                            "${downX.toInt()},${downY.toInt()},${view.width},${view.height}) : false"
+                        view.evaluateJavascript(script) { result ->
+                            if (sequence == gestureSequence) {
+                                customLongPressEligible = result == "true"
+                            }
+                        }
+                    }
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (event.pointerCount != 1 ||
+                        kotlin.math.abs(event.x - downX) > touchSlop ||
+                        kotlin.math.abs(event.y - downY) > touchSlop
+                    ) {
+                        customLongPressEligible = false
+                        ++gestureSequence
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL,
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    if (customLongPressInProgress) {
+                        val api = if (event.actionMasked == MotionEvent.ACTION_UP)
+                            "androidPressReleased" else "androidPressCanceled"
+                        // Execute after the page receives the release. This is a
+                        // fallback when Chromium consumes the page's touchend.
+                        view.post {
+                            view.evaluateJavascript(
+                                "window.__kiTavernChatSelect && " +
+                                    "window.__kiTavernChatSelect.$api();", null
+                            )
+                        }
+                        customLongPressInProgress = false
+                    }
+                    customLongPressEligible = false
+                    ++gestureSequence
+                }
+            }
+            false // Never intercept normal WebView touch/scroll handling.
+        }
+        view.setOnLongClickListener {
+            if (!customLongPressEligible || !UrlValidator.isValid(view.url)) {
+                false // Keep Android's long-press actions on other elements.
+            } else {
+                if (diagnosticsEnabled) Log.d(TAG, "Custom text selection long-press activated")
+                customLongPressInProgress = true
+                val script = "window.__kiTavernChatSelect && " +
+                    "window.__kiTavernChatSelect.longPressAt(" +
+                    "${downX.toInt()},${downY.toInt()},${view.width},${view.height});"
+                view.evaluateJavascript(script, null)
+                true // Our handles own text selection; do not start Chromium's.
+            }
+        }
 
         view.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -612,6 +689,7 @@ class MainActivity : AppCompatActivity() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 invalidateKeyboardLift()
+                selectionToolbar.dismissOnBack()
                 // Only ping when the local fallback has fully loaded and is idle.
                 mainFrameLoading = true
                 recoveryNavigationPending = false
@@ -625,6 +703,7 @@ class MainActivity : AppCompatActivity() {
                     injectBlobInterceptor(view)
                     installKeyboardLift(view)
                     installScrollbarDrag(view)
+                    installChatTextSelection(view)
                     installDebugHeartbeat(view)
                 }
                 mainFrameLoading = false
@@ -1060,7 +1139,8 @@ class MainActivity : AppCompatActivity() {
                 // Touch listeners, rather than only pointer capture, are important on
                 // Android: native panning can cancel the pointer event stream.
                 document.addEventListener('touchstart', function(e) {
-                    if (e.touches.length !== 1) return;
+                    if (e.touches.length !== 1 ||
+                        (e.target.closest && e.target.closest('.ki-chat-select-control'))) return;
                     var t = e.changedTouches[0];
                     if (begin(t.clientX, t.clientY, t.identifier, 'touch')) {
                         e.preventDefault();
@@ -1093,7 +1173,8 @@ class MainActivity : AppCompatActivity() {
 
                 // Keep the same behaviour for a mouse or stylus dragging a thumb.
                 document.addEventListener('pointerdown', function(e) {
-                    if (e.pointerType === 'touch' || e.button !== 0) return;
+                    if (e.pointerType === 'touch' || e.button !== 0 ||
+                        (e.target.closest && e.target.closest('.ki-chat-select-control'))) return;
                     if (begin(e.clientX, e.clientY, e.pointerId, 'pointer')) {
                         try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
                         e.preventDefault();
@@ -1115,6 +1196,25 @@ class MainActivity : AppCompatActivity() {
             })();
             """.trimIndent(), null
         )
+    }
+
+    /** Chat-first selection handles with bounded, smooth edge auto-scroll. */
+    private fun installChatTextSelection(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        try {
+            val script = assets.open("chat_selection_handles.js").bufferedReader().use { it.readText() }
+            target.evaluateJavascript(script) { result ->
+                // Surface missing assets/JavaScript errors in Logcat instead of
+                // silently proceeding as though selection injection succeeded.
+                if (result == "\"selection-v3\"" || result == "\"already installed\"") {
+                    Log.d(TAG, "Chat text selection controller ready ($result)")
+                } else {
+                    Log.w(TAG, "Chat text selection injection returned: $result")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not install chat text selection", e)
+        }
     }
 
     /** Development-only timer-delay diagnostics; never a watchdog or reload trigger. */
@@ -1366,6 +1466,7 @@ class MainActivity : AppCompatActivity() {
             if (observer.isAlive) observer.removeOnGlobalLayoutListener(keyboardLayoutListener)
         }
         invalidateKeyboardLift()
+        selectionToolbar.detach()
         if (::noPagePinger.isInitialized) noPagePinger.close()
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
