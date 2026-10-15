@@ -1,6 +1,7 @@
 /* Chat-first touch text selection for Android WebView.
- * SillyTavern's #chat is preferred when present. On other sites, use the nearest
- * scrollable text container, or the main/article area of the document.
+ * SillyTavern's #chat is preferred when present. Other ordinary page text,
+ * including visible menu/dialog labels, uses the same handles and toolbar.
+ * Editable controls and real links retain their native long-press behaviour.
  * Uses Android's floating ActionMode through a tiny Kotlin bridge; no extra engine.
  */
 (function () {
@@ -69,9 +70,17 @@
     var SELECTION_SCROLL_AFTER_4S_MULTIPLIER = 2.0; // Edit this: 2.1, 4, etc.
 
     var DOCUMENT_SCROLL = document.scrollingElement || document.documentElement;
-    var EXCLUDE = 'a,button,input,textarea,select,option,label,summary,' +
-        '[contenteditable],[role="button"],[role="textbox"],[role="link"],' +
-        '[aria-hidden="true"],[inert],.mes_buttons,.mes_edit_buttons,' +
+    // Only elements requiring native editing, link actions, or non-text controls
+    // are excluded. In particular, do not exclude nav/header/footer/labels or
+    // button/menu-item *text*: those were causing an inconsistent mixture of
+    // Chromium's selection handles and our own across normal page interfaces.
+    // Actual selection still requires a visible text-node hit (see eligible()).
+    var EXCLUDE = 'a[href],input,textarea,select,option,' +
+        '[contenteditable],[role="textbox"],[role="searchbox"],' +
+        '[role="link"],[role="combobox"],[role="slider"],' +
+        '[role="spinbutton"],[role="switch"],[role="checkbox"],' +
+        '[role="radio"],[aria-hidden="true"],[inert],[hidden],' +
+        'script,style,noscript,template,svg,canvas,' +
         '.code-copy,.ki-chat-select-control';
 
     function inside(root, node) { return !!(root && node && root.contains(node)); }
@@ -83,23 +92,34 @@
     }
     function areaFor(target) {
         if (!target || !target.closest || target.closest(EXCLUDE)) return null;
-        // Do not replace custom selection or editor widgets with kiosk handles.
-        if (target.closest('nav,header,footer,[role="navigation"],svg,canvas')) return null;
+        // Labels tied to form controls should keep native focus/edit handling.
+        var label = target.closest('label');
+        if (label && label.control) return null;
         var chat = document.getElementById('chat');
         if (inside(chat, target)) return {root:chat, scroll:chat, chat:true};
+
+        // Prefer the nearest independently scrollable area. This supports
+        // scrollable settings panes, dialogs, and dropdowns on other websites.
         var scroll = null;
         for (var el = target; el && el !== document.body; el = el.parentElement) {
             if (canScroll(el)) { scroll = el; break; }
         }
         if (scroll) return {root:scroll, scroll:scroll, chat:false};
-        // On regular pages, prefer main/article text over the entire webpage;
-        // don't let selection wander into navigation or a fixed composer.
-        var root = target.closest('main,[role="main"]') ||
-            target.closest('article,[role="article"],[itemprop="articleBody"]') ||
+
+        // Fixed/popover menu text shouldn't inherit the whole document as its
+        // selection range. Constrain it to the closest meaningful UI region.
+        var region = target.closest(
+            'dialog,[role="dialog"],[role="alertdialog"],' +
+            '[role="menu"],[role="menubar"],[role="listbox"],' +
+            '[role="tree"],[role="tablist"],[role="toolbar"],' +
+            '[role="navigation"],nav,header,footer,aside,[popover]');
+        var root = region || target.closest(
+            'main,[role="main"],article,[role="article"],[itemprop="articleBody"]') ||
             document.body;
         if (!root || root === document.documentElement) return null;
         return {root:root, scroll:DOCUMENT_SCROLL, chat:false};
     }
+
     function viewportBox(area) {
         var vv = window.visualViewport;
         var left = vv ? vv.offsetLeft : 0;
