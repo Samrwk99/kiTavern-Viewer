@@ -57,12 +57,13 @@
     var lastToolbarUpdate = 0;
     var correctedExternalScrolls = 0;
 
-    // Selection-handle edge scrolling, measured in CSS pixels per second.
-    // The tested values reach maximum speed after about 4.7 CSS pixels
-    // beyond the edge threshold. Keep the existing drag-jump guard unchanged.
-    var SELECTION_SCROLL_BASE_PX_PER_SECOND = 2048;
+    // Selection-handle autoscroll (CSS pixels per second): start gently and
+    // ramp up while a handle continuously scrolls near an edge. Letting go,
+    // leaving the edge zone, changing direction or hitting an end resets it.
+    // The maximum is the user's tested, reliable 2048 px/s setting.
+    var SELECTION_SCROLL_START_PX_PER_SECOND = 850;
     var SELECTION_SCROLL_MAX_PX_PER_SECOND = 2048;
-    var SELECTION_SCROLL_GAIN_PER_EDGE_PIXEL = 128;
+    var SELECTION_SCROLL_RAMP_SECONDS = 1.4;
 
     var DOCUMENT_SCROLL = document.scrollingElement || document.documentElement;
     var EXCLUDE = 'a,button,input,textarea,select,option,label,summary,' +
@@ -565,12 +566,20 @@
         lastFrameTime = now;
         var moved = false;
         if (delta) {
-            // Preserve the tested speed curve exactly; only its configurable
-            // constants have been named for clarity.
-            var speed = Math.sign(delta) *
-                Math.min(SELECTION_SCROLL_MAX_PX_PER_SECOND,
-                    SELECTION_SCROLL_BASE_PX_PER_SECOND +
-                    SELECTION_SCROLL_GAIN_PER_EDGE_PIXEL * Math.abs(delta));
+            var direction = Math.sign(delta);
+            if (drag.edgeScrollDirection !== direction) {
+                // A fresh edge scroll (or a reversal) starts unaccelerated.
+                drag.edgeScrollDirection = direction;
+                drag.edgeScrollElapsedSeconds = 0;
+            }
+            // Smoothly accelerate over time, not by jumping to the maximum
+            // when the finger moves a few pixels further beyond the edge.
+            var progress = Math.min(1,
+                drag.edgeScrollElapsedSeconds / SELECTION_SCROLL_RAMP_SECONDS);
+            var eased = progress * progress * (3 - 2 * progress);
+            var speed = direction * (SELECTION_SCROLL_START_PX_PER_SECOND +
+                (SELECTION_SCROLL_MAX_PX_PER_SECOND -
+                    SELECTION_SCROLL_START_PX_PER_SECOND) * eased);
             var before = area.scroll.scrollTop;
             var next = Math.max(0, Math.min(
                 area.scroll.scrollHeight - area.scroll.clientHeight,
@@ -579,6 +588,12 @@
             area.scroll.scrollTop = next;
             drag.expectedTop = area.scroll.scrollTop;
             moved = Math.abs(area.scroll.scrollTop - before) > .01;
+            if (moved) drag.edgeScrollElapsedSeconds += dt;
+        }
+        if (!delta || !moved) {
+            // Once scrolling pauses, the next movement starts at base speed.
+            drag.edgeScrollDirection = 0;
+            drag.edgeScrollElapsedSeconds = 0;
         }
         var pt = fromXY(area, drag.x, drag.y);
         if (pt) {
