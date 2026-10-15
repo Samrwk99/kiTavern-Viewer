@@ -25,6 +25,7 @@ import kotlin.math.min
 internal class SelectionToolbar(private val activity: MainActivity) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var page: WebView? = null
+    private val findOnPage = FindOnPageBar(activity)
     private var toolbarHost: View? = null
     private var floatingMode: ActionMode? = null
     private val selectionRect = Rect()
@@ -35,6 +36,7 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         const val SHARE = 2
         const val SELECT_ALL = 3
         const val SEARCH = 4
+        const val FIND_ON_PAGE = 5
         const val PROCESS_FIRST = 100
         const val INTERFACE_NAME = "KiTavernSelectionToolbar"
     }
@@ -54,6 +56,7 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         fun show(left: Double, top: Double, right: Double, bottom: Double,
                  viewportWidth: Double, viewportHeight: Double) {
             mainHandler.post {
+                if (findOnPage.isVisible) return@post
                 val view = page ?: return@post
                 if (!view.isAttachedToWindow || view.width <= 0 || view.height <= 0 ||
                     viewportWidth <= 0 || viewportHeight <= 0 ||
@@ -97,6 +100,8 @@ internal class SelectionToolbar(private val activity: MainActivity) {
             menu.add(Menu.NONE, SHARE, 1, "Share").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
             menu.add(Menu.NONE, SELECT_ALL, 2, "Select all").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
             menu.add(Menu.NONE, SEARCH, 3, "Web search").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
+            menu.add(Menu.NONE, FIND_ON_PAGE, 4, "Find on page")
+                .setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
 
             // The same ACTION_PROCESS_TEXT contract used by Android's normal text tools.
             processTargets.clear()
@@ -129,6 +134,12 @@ internal class SelectionToolbar(private val activity: MainActivity) {
                         "window.__kiTavernChatSelect && window.__kiTavernChatSelect.selectAll();", null
                     )
                     return true
+                }
+                FIND_ON_PAGE -> withSelectedText { text ->
+                    // Close our custom text selection before starting a normal
+                    // WebView find session; otherwise its handles overlay matches.
+                    dismissSelection()
+                    page?.let { findOnPage.show(it, text) }
                 }
                 COPY, SHARE, SEARCH -> withSelectedText { text ->
                     if (text.isNotEmpty()) when (item.itemId) {
@@ -207,12 +218,14 @@ internal class SelectionToolbar(private val activity: MainActivity) {
     }
 
     fun dismissOnBack(): Boolean {
+        if (findOnPage.dismiss()) return true
         if (floatingMode == null) return false
         dismissSelection()
         return true
     }
 
     fun detach() {
+        findOnPage.dismiss()
         finishToolbar()
         page = null
         toolbarHost = null
