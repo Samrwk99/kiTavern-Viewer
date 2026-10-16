@@ -6,6 +6,7 @@ local.properties
 
 # Build artifacts and caches
 build/
+gradle/wrapper/gradle-wrapper.jar
 .gradle/
 .kotlin/
 *.apk
