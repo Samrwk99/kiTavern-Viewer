@@ -51,13 +51,26 @@
         '.' + TOUCH_LOCK + ' textarea.__kiFieldSelectActive, ' +
         'input.__kiFieldSelectActive,textarea.__kiFieldSelectActive{' +
         '-webkit-user-select:none!important;user-select:none!important;}' +
-        '#__kiChatSelectOverlay .ki-chat-select-handle{position:fixed;' +
-        'width:34px;height:44px;margin-left:-17px;touch-action:none;' +
+        '#__kiChatSelectOverlay .ki-chat-select-handle,' +
+        '.ki-chat-select-scroll-host .ki-chat-select-handle{' +
+        'position:fixed;width:34px;height:44px;margin-left:-17px;touch-action:none;' +
         'pointer-events:auto;-webkit-tap-highlight-color:transparent;}' +
-        '#__kiChatSelectOverlay .ki-chat-select-handle::before{' +
+        // For ordinary finger scrolling, place handles in the same scrolled
+        // content layer as the selected text. Chromium composites them together
+        // rather than waiting for our next main-thread scroll/animation frame.
+        '.ki-chat-select-scroll-host{' +
+        'position:relative!important;display:block!important;' +
+        'width:0!important;height:0!important;min-height:0!important;' +
+        'margin:0!important;padding:0!important;border:0!important;' +
+        'flex:0 0 0!important;overflow:visible!important;' +
+        'pointer-events:none!important;z-index:2147483640!important;}' +
+        '.ki-chat-select-scroll-host .ki-chat-select-handle{position:absolute;}' +
+        '#__kiChatSelectOverlay .ki-chat-select-handle::before,' +
+        '.ki-chat-select-scroll-host .ki-chat-select-handle::before{' +
         'content:"";position:absolute;left:16px;top:0;width:2px;height:23px;' +
         'background:#2196f3;border-radius:2px;}' +
-        '#__kiChatSelectOverlay .ki-chat-select-handle::after{' +
+        '#__kiChatSelectOverlay .ki-chat-select-handle::after,' +
+        '.ki-chat-select-scroll-host .ki-chat-select-handle::after{' +
         'content:"";position:absolute;left:9px;top:21px;width:16px;height:16px;' +
         'background:#2196f3;border-radius:50%;}' +
         '';
@@ -274,6 +287,20 @@
     }
     function beginMotion() {
         if (!session || drag) return;
+        if (session.handleHost) {
+            // Both handles now scroll *with* the content. Do not overwrite
+            // their stable content coordinates with asynchronous viewport
+            // measurements during compositor-driven touch/momentum scrolling.
+            if (!session.nativeHighlight) session.marks.style.visibility = 'hidden';
+            if (motionSettleTimer) clearTimeout(motionSettleTimer);
+            motionSettleTimer = setTimeout(function () {
+                motionSettleTimer = null;
+                if (!session || drag) return;
+                session.marks.style.visibility = '';
+                scheduleDraw();
+            }, 140);
+            return;
+        }
         if (!session.handlePositionSnapshot) {
             scheduleDraw();
             return;
@@ -419,6 +446,7 @@
         if (previous.resizeObserver) previous.resizeObserver.disconnect();
         if (previous.layoutObserver) previous.layoutObserver.disconnect();
         if (previous.overlay.parentNode) previous.overlay.remove();
+        if (previous.handleHost) previous.handleHost.remove();
         if (previous.nativeHighlight) CSS.highlights.delete(HIGHLIGHT_NAME);
         if (previous.area.field) previous.area.field.classList.remove('__kiFieldSelectActive');
         session = null;
@@ -639,6 +667,31 @@
         endHandle.addEventListener('pointerdown', beginMouseHandle);
         return {overlay: overlay, marks: marks, handles: [startHandle, endHandle]};
     }
+    function attachScrollAnchoredHandles(current) {
+        var scroller = current.area.scroll;
+        if (current.area.field || scroller === DOCUMENT_SCROLL ||
+            scroller === document.body || scroller === document.documentElement)
+            return;
+        // Table/grid and editable scroll hosts may have special child-layout
+        // rules. Keep the existing fixed-position path for those elements.
+        var scrollStyle = getComputedStyle(scroller);
+        var display = scrollStyle.display;
+        if (display !== 'block' && display !== 'flex' &&
+            display !== 'flow-root') return;
+        if (display === 'flex' && scrollStyle.flexDirection !== 'column') return;
+        // Sticky/fixed text does not travel with ordinary scroll content.
+        // Keep the original viewport-based positioning for that special case.
+        for (var el = current.start.node.parentElement; el && el !== scroller;
+             el = el.parentElement) {
+            var position = getComputedStyle(el).position;
+            if (position === 'sticky' || position === 'fixed') return;
+        }
+        var host = make('div', 'ki-chat-select-scroll-host');
+        host.setAttribute('role', 'presentation');
+        scroller.insertBefore(host, scroller.firstChild);
+        current.handles.forEach(function (handle) { host.appendChild(handle); });
+        current.handleHost = host;
+    }
     // Probe at ACTION_DOWN so Android can synchronously consume the matching
     // long-click later. The probe is intentionally read-only: no selection,
     // styles, timers, or DOM edits are performed by this call.
@@ -726,6 +779,7 @@
         }
         session.start = pair.start;
         session.end = pair.end;
+        attachScrollAnchoredHandles(session);
         if (USE_NATIVE_HIGHLIGHT) {
             try {
                 session.nativeHighlight = new Highlight();
@@ -745,15 +799,24 @@
         // selection exists, and realign once those layout changes settle.
         if (typeof ResizeObserver === 'function') {
             current.resizeObserver = new ResizeObserver(function () {
-                if (session === current && !drag) beginMotion();
+                if (session !== current || drag) return;
+                if (current.handleHost) scheduleDraw();
+                else beginMotion();
             });
             current.resizeObserver.observe(current.area.root);
             if (current.area.scroll !== current.area.root)
                 current.resizeObserver.observe(current.area.scroll);
         }
         if (typeof MutationObserver === 'function') {
-            current.layoutObserver = new MutationObserver(function () {
-                if (session === current && !drag) beginMotion();
+            current.layoutObserver = new MutationObserver(function (records) {
+                if (session !== current || drag) return;
+                // Handle positioning itself changes style attributes. Ignore
+                // those mutations to avoid triggering a redraw feedback loop.
+                if (current.handleHost && records.every(function (record) {
+                    return current.handleHost.contains(record.target);
+                })) return;
+                if (current.handleHost) scheduleDraw();
+                else beginMotion();
             });
             current.layoutObserver.observe(current.area.root, {
                 subtree:true, childList:true, characterData:true, attributes:true,
@@ -764,6 +827,17 @@
     function showHandle(handle, point, box) {
         handle.style.transform = '';
         var rect = pointRect(point);
+        if (session && session.handleHost) {
+            if (!rect) { handle.style.display = 'none'; return null; }
+            // The host and text are in the same scroll coordinate system.
+            // Their difference remains constant while the compositor scrolls,
+            // avoiding the visible one-frame lag of fixed screen-space handles.
+            var origin = session.handleHost.getBoundingClientRect();
+            handle.style.display = 'block';
+            handle.style.left = (rect.left - origin.left) + 'px';
+            handle.style.top = (rect.bottom - 2 - origin.top) + 'px';
+            return rect;
+        }
         if (!rect || rect.bottom < box.top || rect.top > box.bottom ||
             rect.right < box.left || rect.left > box.right) {
             handle.style.display = 'none';
