@@ -83,7 +83,13 @@
     var frame = 0;
     var lastFrameTime = 0;
     var toolbarTimer = null;
-    var toolbarRepositionTimer = null;
+    // While any webpage scroll is moving, keep Android's floating toolbar
+    // hidden without clearing the selection or the custom handle positions.
+    var toolbarScrollIdleTimer = null;
+    var toolbarPausedForScroll = false;
+    // A grabbed scrollbar keeps the toolbar hidden until its finger releases.
+    var toolbarScrollbarHeld = false;
+    var toolbarTouchHeld = false;
     var lastToolbarUpdate = 0;
     var correctedExternalScrolls = 0;
     var recentFieldTouch = null;
@@ -378,13 +384,61 @@
     }
     function hideToolbar() {
         if (toolbarTimer) { clearTimeout(toolbarTimer); toolbarTimer = null; }
-        if (toolbarRepositionTimer) {
-            clearTimeout(toolbarRepositionTimer);
-            toolbarRepositionTimer = null;
-        }
         if (session) session.nativeToolbarVisible = false;
         var bridge = nativeToolbar();
         if (bridge) bridge.hide();
+    }
+    function cancelToolbarScrollPause() {
+        if (toolbarScrollIdleTimer) clearTimeout(toolbarScrollIdleTimer);
+        toolbarScrollIdleTimer = null;
+        toolbarPausedForScroll = false;
+        toolbarTouchHeld = false;
+    }
+    function toolbarScrollMoved() {
+        if (!session || drag) return;
+        // End Android's ActionMode only once per scrolling gesture. Repeated
+        // finish/start calls while the page moves can steal focus and jitter.
+        if (!toolbarPausedForScroll) {
+            toolbarPausedForScroll = true;
+            if (session.nativeToolbarVisible) hideToolbar();
+        }
+        if (toolbarScrollIdleTimer) clearTimeout(toolbarScrollIdleTimer);
+        toolbarScrollIdleTimer = null;
+        // Do not restore the popup while a scrollbar thumb is still held.
+        if (toolbarScrollbarHeld || toolbarTouchHeld) return;
+        var current = session;
+        toolbarScrollIdleTimer = setTimeout(function () {
+            toolbarScrollIdleTimer = null;
+            if (session !== current || drag) return;
+            toolbarPausedForScroll = false;
+            // Re-measure the selected text after kinetic movement settles;
+            // don't change the actual range or either selection handle.
+            scheduleDraw();
+            showToolbar(true);
+        }, 280);
+    }
+    function toolbarTouchStarted() {
+        if (!session || drag) return;
+        toolbarTouchHeld = true;
+        // A compositor-driven swipe may not send a touchmove until after the
+        // scroll starts. Hide on finger-down rather than waiting for that event.
+        toolbarScrollMoved();
+    }
+    function toolbarTouchFinished() {
+        if (!toolbarTouchHeld) return;
+        toolbarTouchHeld = false;
+        // Wait for scrolling/momentum to settle before restoring the menu.
+        toolbarScrollMoved();
+    }
+    function scrollbarTouchStarted() {
+        toolbarScrollbarHeld = true;
+        toolbarScrollMoved();
+    }
+    function scrollbarTouchFinished() {
+        if (!toolbarScrollbarHeld) return;
+        toolbarScrollbarHeld = false;
+        // Start the normal idle delay only after releasing the thumb.
+        toolbarScrollMoved();
     }
     function selectionAnchor() {
         if (!session) return null;
@@ -413,7 +467,8 @@
         return {left:left, top:top, right:right, bottom:bottom};
     }
     function showToolbar(force) {
-        if (!session || drag || session.waitingForRelease !== null) return;
+        if (!session || drag || toolbarPausedForScroll ||
+            session.waitingForRelease !== null) return;
         var bridge = nativeToolbar();
         if (!bridge) return;
         var now = performance.now();
@@ -435,6 +490,7 @@
         }, delay);
     }
     function closeSelection() {
+        cancelToolbarScrollPause();
         hideToolbar();
         cancelMotion();
         stopFrame();
@@ -940,15 +996,10 @@
     }
     function onSelectionScroll() {
         if (drag) guardDragScroll();
-        else beginMotion();
-        if (!session || drag || !session.nativeToolbarVisible) return;
-        // Only reposition a native popup after a scroll gesture settles.
-        // Updating ActionMode every frame was disrupting selection gestures.
-        if (toolbarRepositionTimer) clearTimeout(toolbarRepositionTimer);
-        toolbarRepositionTimer = setTimeout(function () {
-            toolbarRepositionTimer = null;
-            if (session && !drag && session.nativeToolbarVisible) showToolbar(true);
-        }, 250);
+        else {
+            beginMotion();
+            toolbarScrollMoved();
+        }
     }
     function beginHandle(e) {
         if (!session || e.touches.length !== 1) return;
@@ -1167,6 +1218,8 @@
         },
         selectAll:selectAll,
         dismiss:closeSelection,
+        scrollbarTouchStarted:scrollbarTouchStarted,
+        scrollbarTouchFinished:scrollbarTouchFinished,
         status:function () {
             return {installed:true, version:4, active:!!session,
                 correctedExternalScrolls:correctedExternalScrolls,
@@ -1179,6 +1232,7 @@
         if (drag || window.__kiTavernScrollbarDragging ||
             (e.target.closest && e.target.closest('.' + HANDLE_CLASS))) return;
         stopPending();
+        toolbarTouchStarted();
         var t = e.changedTouches[0];
         var area = eligible(e.target, t.clientX, t.clientY);
         // Only allow native-to-custom input handoff for a recent real touch;
@@ -1203,12 +1257,11 @@
         if (tapCandidate) {
             for (var k = 0; k < e.changedTouches.length; k++) {
                 var movedTouch = e.changedTouches[k];
-                if (movedTouch.identifier === tapCandidate.id &&
-                    (Math.abs(movedTouch.clientX - tapCandidate.x) > 9 ||
-                     Math.abs(movedTouch.clientY - tapCandidate.y) > 9)) {
+                if (movedTouch.identifier !== tapCandidate.id) continue;
+                if (Math.abs(movedTouch.clientX - tapCandidate.x) > 9 ||
+                    Math.abs(movedTouch.clientY - tapCandidate.y) > 9)
                     tapCandidate = null;
-                    break;
-                }
+                break;
             }
         }
         if (!pending) return;
@@ -1235,6 +1288,7 @@
             }
         }
         endDrag(e, 'touch');
+        toolbarTouchFinished();
         if (tapCandidate) {
             for (var j = 0; j < e.changedTouches.length; j++) {
                 if (e.changedTouches[j].identifier === tapCandidate.id) {
@@ -1253,7 +1307,8 @@
         }
     }, true);
     document.addEventListener('touchcancel', function (e) {
-        endDrag(e, 'touch'); stopPending(); tapCandidate = null;
+        endDrag(e, 'touch'); toolbarTouchFinished();
+        stopPending(); tapCandidate = null;
         recentFieldTouch = null;
     }, true);
     // If Chromium consumes a field long press before our timer, its native
@@ -1292,6 +1347,10 @@
                 '[role="textbox"],[role="searchbox"]')) return;
         if (session.area.root !== target) closeSelection();
     }, true);
+    // Wheel/trackpad input can scroll before Chromium sends a scroll event.
+    document.addEventListener('wheel', function () {
+        if (session && !drag) toolbarScrollMoved();
+    }, {capture:true, passive:true});
     document.addEventListener('pointermove', function (e) { updateDrag(e, 'pointer'); }, true);
     document.addEventListener('pointerup', function (e) { endDrag(e, 'pointer'); }, true);
     document.addEventListener('pointercancel', function (e) { endDrag(e, 'pointer'); }, true);
@@ -1302,16 +1361,25 @@
              (session && session.area.field === editableFieldFor(e.target))))
             e.preventDefault();
     }, true);
-    window.addEventListener('scroll', function () {
+    window.addEventListener('scroll', function (event) {
+        // The selected scroller has its own listener; don't process twice.
+        if (session && event.target === session.area.scroll) return;
         if (drag) guardDragScroll();
-        else beginMotion();
+        else {
+            beginMotion();
+            toolbarScrollMoved();
+        }
     }, true);
-    // Keyboard/visual-viewport transitions also change content geometry.
-    // Debounce their Range measurements until the layout has settled.
-    window.addEventListener('resize', beginMotion);
+    // Keyboard and visual-viewport transitions move selected content too.
+    // Treat them like scrolling so the popup returns beside its new position.
+    function viewportMoved() {
+        beginMotion();
+        toolbarScrollMoved();
+    }
+    window.addEventListener('resize', viewportMoved);
     if (window.visualViewport) {
-        window.visualViewport.addEventListener('resize', beginMotion);
-        window.visualViewport.addEventListener('scroll', beginMotion);
+        window.visualViewport.addEventListener('resize', viewportMoved);
+        window.visualViewport.addEventListener('scroll', viewportMoved);
     }
     // A floating Android ActionMode can move window focus temporarily.
     // Losing focus must not discard the selected range or its handles.
