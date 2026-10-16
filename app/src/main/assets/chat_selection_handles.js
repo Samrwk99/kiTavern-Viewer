@@ -75,9 +75,9 @@
     var correctedExternalScrolls = 0;
     var recentFieldTouch = null;
     var fieldSelectReentry = false;
-    // During an ordinary scroll, move handles by the scroll offset rather than
-    // repeatedly querying DOM Range geometry while Chromium is compositing.
-    // After scrolling settles, snap back to the real text endpoints once.
+    // During an ordinary scroll, project the last *real caret* positions using
+    // the selected container's movement; remeasure once the motion settles.
+    // This avoids WebView compositor lag and edge-clamped handle drift.
     var motionFrame = 0;
     var motionSettleTimer = null;
     var motionActive = false;
@@ -204,30 +204,15 @@
         frame = 0;
         lastFrameTime = 0;
     }
-    // Snapshot every scrolling ancestor, not just #chat. This covers popup
-    // panes and whole-page scrolling without changing their DOM/CSS layout.
-    function scrollSnapshot(area) {
-        var values = [];
-        var seen = [];
-        for (var el = area.root; el; el = el.parentElement) {
-            if (el === document.documentElement) break;
-            values.push({el:el, top:el.scrollTop, left:el.scrollLeft});
-            seen.push(el);
-        }
-        var rootScroller = document.scrollingElement || document.documentElement;
-        if (seen.indexOf(rootScroller) < 0)
-            values.push({el:rootScroller, top:rootScroller.scrollTop,
-                left:rootScroller.scrollLeft});
-        return values;
-    }
-    function recordHandlePositions() {
+    // Save only the stationary handle origins. While the user scrolls with a
+    // finger, the caret's live DOM rectangle (not an estimated scroll delta)
+    // is the source of truth for where the visible handle should be painted.
+    function recordHandlePositions(rects) {
         if (!session) return;
         session.handlePositionSnapshot = {
-            scrolls:scrollSnapshot(session.area),
             handles:session.handles.map(function (handle) {
                 return {left:parseFloat(handle.style.left) || 0,
-                    top:parseFloat(handle.style.top) || 0,
-                    visible:handle.style.display !== 'none'};
+                    top:parseFloat(handle.style.top) || 0};
             })
         };
     }
@@ -248,35 +233,44 @@
         motionFrame = 0;
         if (!session || drag || !motionActive) return;
         var base = session.handlePositionSnapshot;
-        if (!base) return;
-        var dx = 0, dy = 0;
-        base.scrolls.forEach(function (s) {
-            if (!s.el.isConnected) return;
-            dx += s.el.scrollLeft - s.left;
-            dy += s.el.scrollTop - s.top;
-        });
-        // Translate the fixed-position controls through compositor-friendly
-        // transforms. The text's true Range rectangles can lag for a frame or
-        // two during native flings, so don't sample them until the scroll stops.
+        if (!base) { scheduleDraw(); return; }
+
+        // A finger-driven (composited/kinetic) scroll isn't guaranteed to move
+        // by the same distance as root.scrollTop on the JavaScript thread. The
+        // highlighted text is painted from the live DOM Range, so measure those
+        // same caret endpoints and place the handles against those rectangles.
+        // Unlike draw(), this changes only the two handle transforms and never
+        // rebuilds the selection or its highlight while the page is moving.
+        if (session.area.field) {
+            syncFieldMirror(session);
+            if (!session) return;
+        }
         var box = viewportBox(session.area);
-        base.handles.forEach(function (p, i) {
+        [session.start, session.end].forEach(function (point, i) {
             var handle = session.handles[i];
-            if (!p.visible || p.top - dy + 37 < box.top ||
-                p.top - dy > box.bottom || p.left - dx < box.left - 20 ||
-                p.left - dx > box.right + 20) {
+            var r = pointRect(point);
+            if (!r || r.bottom < box.top || r.top > box.bottom ||
+                r.right < box.left || r.left > box.right) {
                 handle.style.display = 'none';
                 return;
             }
+            var left = Math.max(box.left + 17,
+                Math.min(box.right - 17, r.left));
+            var top = Math.max(box.top,
+                Math.min(box.bottom - 40, r.bottom - 2));
             handle.style.display = 'block';
-            handle.style.transform = 'translate3d(' + (-dx) + 'px,' + (-dy) + 'px,0)';
+            handle.style.transform = 'translate3d(' +
+                (left - base.handles[i].left) + 'px,' +
+                (top - base.handles[i].top) + 'px,0)';
         });
-        // On older WebViews, rectangle highlights aren't tied to content.
-        // Hide those transient overlays rather than show misplaced highlights.
+        // The old-WebView fallback draws its own highlight rectangles; those
+        // shouldn't stay frozen in screen space during a kinetic scroll.
         if (!session.nativeHighlight) session.marks.style.visibility = 'hidden';
-        if (session.area.field && session.mirror) {
-            session.mirror.scrollTop = session.area.field.scrollTop;
-            session.mirror.scrollLeft = session.area.field.scrollLeft;
-        }
+        // WebView can animate touch/kinetic scrolling on its compositor between
+        // main-thread scroll events. Follow the live caret positions every
+        // displayed frame until motion settles, not just when an event arrives.
+        if (motionActive && session && !drag)
+            motionFrame = requestAnimationFrame(motionTick);
     }
     function beginMotion() {
         if (!session || drag) return;
@@ -773,13 +767,14 @@
         if (!rect || rect.bottom < box.top || rect.top > box.bottom ||
             rect.right < box.left || rect.left > box.right) {
             handle.style.display = 'none';
-            return;
+            return rect;
         }
         handle.style.display = 'block';
         handle.style.left = Math.max(box.left + 17,
             Math.min(box.right - 17, rect.left)) + 'px';
         handle.style.top = Math.max(box.top,
             Math.min(box.bottom - 40, rect.bottom - 2)) + 'px';
+        return rect;
     }
     function draw() {
         if (!session) return;
@@ -854,9 +849,9 @@
             }
             session.marks.replaceChildren(frag);
         }
-        showHandle(session.handles[0], session.start, box);
-        showHandle(session.handles[1], session.end, box);
-        recordHandlePositions();
+        var startRect = showHandle(session.handles[0], session.start, box);
+        var endRect = showHandle(session.handles[1], session.end, box);
+        recordHandlePositions([startRect, endRect]);
         // The native toolbar stays anchored during normal scrolling; moving its
         // content rect every animation frame can disrupt WebView touch handling.
     }
