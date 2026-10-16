@@ -396,11 +396,15 @@
     }
     function toolbarScrollMoved() {
         if (!session || drag) return;
-        // End Android's ActionMode only once per scrolling gesture. Repeated
-        // finish/start calls while the page moves can steal focus and jitter.
+        // Temporarily hide the *existing* floating ActionMode. Finishing and
+        // recreating it on every swipe left its dismissal animation lingering
+        // over moving text on some Android builds.
         if (!toolbarPausedForScroll) {
             toolbarPausedForScroll = true;
-            if (session.nativeToolbarVisible) hideToolbar();
+            if (toolbarTimer) { clearTimeout(toolbarTimer); toolbarTimer = null; }
+            var bridge = nativeToolbar();
+            if (bridge && bridge.pause) bridge.pause();
+            else if (session.nativeToolbarVisible) hideToolbar();
         }
         if (toolbarScrollIdleTimer) clearTimeout(toolbarScrollIdleTimer);
         toolbarScrollIdleTimer = null;

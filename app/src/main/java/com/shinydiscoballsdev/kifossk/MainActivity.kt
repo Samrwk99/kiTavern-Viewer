@@ -760,6 +760,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
         view.setOnTouchListener { _, event ->
+            // Pause the native floating selection toolbar before Chromium's
+            // compositor begins a touch scroll. The JS touchstart/scroll event
+            // can otherwise arrive a frame late and leave the popup visible.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                selectionToolbar.pauseForScroll()
+            }
             // Intercept at the Android View boundary *before* Chromium can claim
             // the native scrollbar drag on the compositor. Otherwise it may
             // move without our blue pressed state and race the JS scroll guard.

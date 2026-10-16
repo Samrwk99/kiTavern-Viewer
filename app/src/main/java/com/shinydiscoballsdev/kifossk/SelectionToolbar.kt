@@ -29,6 +29,18 @@ internal class SelectionToolbar(private val activity: MainActivity) {
     private val findOnPage = FindOnPageBar(activity)
     private var toolbarHost: View? = null
     private var floatingMode: ActionMode? = null
+    private var scrollPaused = false
+    // Android's ActionMode.hide() is temporary (and internally time-limited).
+    // Refresh it only while an actual scroll/press is active, without
+    // destroying and rebuilding the toolbar or its menu items.
+    private val keepToolbarHidden = object : Runnable {
+        override fun run() {
+            if (!scrollPaused) return
+            floatingMode?.hide(1200L)
+            if (floatingMode != null) mainHandler.postDelayed(this, 700L)
+        }
+    }
+    @Volatile private var visibilityEpoch = 0
     private var editableSelection = false
     private val selectionRect = Rect()
     private val processTargets = mutableMapOf<Int, Intent>()
@@ -55,12 +67,38 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         view.addJavascriptInterface(Bridge(), INTERFACE_NAME)
     }
 
+    /** Immediate UI-thread response to a new WebView touch, before JS scroll events. */
+    fun pauseForScroll() {
+        visibilityEpoch++
+        if (!scrollPaused) {
+            scrollPaused = true
+            mainHandler.removeCallbacks(keepToolbarHidden)
+            keepToolbarHidden.run()
+        }
+    }
+
+    private fun resumeAfterScroll() {
+        if (!scrollPaused) return
+        scrollPaused = false
+        mainHandler.removeCallbacks(keepToolbarHidden)
+        // A zero-duration hide cancels the temporary hide request and restores
+        // the same ActionMode at its updated content rectangle.
+        floatingMode?.hide(0L)
+    }
+
     private inner class Bridge {
+        @JavascriptInterface
+        fun pause() {
+            mainHandler.post { pauseForScroll() }
+        }
+
         @JavascriptInterface
         fun show(left: Double, top: Double, right: Double, bottom: Double,
                  viewportWidth: Double, viewportHeight: Double, editable: Boolean) {
+            // Discard a stale show which was queued before a new finger press.
+            val requestedEpoch = visibilityEpoch
             mainHandler.post {
-                if (findOnPage.isVisible) return@post
+                if (requestedEpoch != visibilityEpoch || findOnPage.isVisible) return@post
                 val view = page ?: return@post
                 if (!view.isAttachedToWindow || view.width <= 0 || view.height <= 0 ||
                     viewportWidth <= 0 || viewportHeight <= 0 ||
@@ -89,6 +127,8 @@ internal class SelectionToolbar(private val activity: MainActivity) {
                     selectionRect.set(next)
                     floatingMode?.invalidateContentRect()
                 }
+                // Reveal only after the toolbar knows the text's new position.
+                resumeAfterScroll()
                 if (floatingMode == null) {
                     floatingMode = host.startActionMode(toolbarCallback, ActionMode.TYPE_FLOATING)
                 }
@@ -251,6 +291,9 @@ internal class SelectionToolbar(private val activity: MainActivity) {
     }
 
     private fun finishToolbar() {
+        visibilityEpoch++
+        scrollPaused = false
+        mainHandler.removeCallbacks(keepToolbarHidden)
         val previous = floatingMode
         floatingMode = null
         previous?.finish()
