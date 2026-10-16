@@ -760,6 +760,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
         view.setOnTouchListener { _, event ->
+            // Pause the native floating selection toolbar before Chromium's
+            // compositor begins a touch scroll. The JS touchstart/scroll event
+            // can otherwise arrive a frame late and leave the popup visible.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                selectionToolbar.pauseForScroll()
+            }
             // Intercept at the Android View boundary *before* Chromium can claim
             // the native scrollbar drag on the compositor. Otherwise it may
             // move without our blue pressed state and race the JS scroll guard.
@@ -1376,6 +1382,11 @@ class MainActivity : AppCompatActivity() {
                     active = null;
                     window.__kiTavernScrollbarDragging = false;
                     restoreScrollStyle();
+                    // Restore the floating text toolbar only once the thumb
+                    // has been released and the page has settled.
+                    if (window.__kiTavernChatSelect &&
+                        window.__kiTavernChatSelect.scrollbarTouchFinished)
+                        window.__kiTavernChatSelect.scrollbarTouchFinished();
                 }
 
                 function findScrollbar(x, y) {
@@ -1448,6 +1459,11 @@ class MainActivity : AppCompatActivity() {
                     found.el.style.setProperty('scroll-snap-type', 'none', 'important');
                     setPressed(found.el, true);
                     window.__kiTavernScrollbarDragging = true;
+                    // Native thumb capture doesn't produce a webpage touchstart.
+                    // Hide selection's floating toolbar right at the grab.
+                    if (window.__kiTavernChatSelect &&
+                        window.__kiTavernChatSelect.scrollbarTouchStarted)
+                        window.__kiTavernChatSelect.scrollbarTouchStarted();
                     if (kind === 'touch') document.addEventListener('touchmove',
                         onThumbTouchMove, {capture: true, passive: false});
                     // Run immediately, including when the finger has not moved:

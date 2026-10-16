@@ -16,18 +16,32 @@ import android.view.MenuItem
 import android.view.View
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import org.json.JSONObject
 import org.json.JSONTokener
 import java.net.URLEncoder
 import kotlin.math.max
 import kotlin.math.min
 
-/** Android's floating selection toolbar for the chat-only custom selection handles. */
+/** Android floating toolbar for custom webpage and editable-field selection. */
 internal class SelectionToolbar(private val activity: MainActivity) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var page: WebView? = null
     private val findOnPage = FindOnPageBar(activity)
     private var toolbarHost: View? = null
     private var floatingMode: ActionMode? = null
+    private var scrollPaused = false
+    // Android's ActionMode.hide() is temporary (and internally time-limited).
+    // Refresh it only while an actual scroll/press is active, without
+    // destroying and rebuilding the toolbar or its menu items.
+    private val keepToolbarHidden = object : Runnable {
+        override fun run() {
+            if (!scrollPaused) return
+            floatingMode?.hide(1200L)
+            if (floatingMode != null) mainHandler.postDelayed(this, 700L)
+        }
+    }
+    @Volatile private var visibilityEpoch = 0
+    private var editableSelection = false
     private val selectionRect = Rect()
     private val processTargets = mutableMapOf<Int, Intent>()
 
@@ -37,6 +51,8 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         const val SELECT_ALL = 3
         const val SEARCH = 4
         const val FIND_ON_PAGE = 5
+        const val CUT = 6
+        const val PASTE = 7
         const val PROCESS_FIRST = 100
         const val INTERFACE_NAME = "KiTavernSelectionToolbar"
     }
@@ -51,12 +67,38 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         view.addJavascriptInterface(Bridge(), INTERFACE_NAME)
     }
 
+    /** Immediate UI-thread response to a new WebView touch, before JS scroll events. */
+    fun pauseForScroll() {
+        visibilityEpoch++
+        if (!scrollPaused) {
+            scrollPaused = true
+            mainHandler.removeCallbacks(keepToolbarHidden)
+            keepToolbarHidden.run()
+        }
+    }
+
+    private fun resumeAfterScroll() {
+        if (!scrollPaused) return
+        scrollPaused = false
+        mainHandler.removeCallbacks(keepToolbarHidden)
+        // A zero-duration hide cancels the temporary hide request and restores
+        // the same ActionMode at its updated content rectangle.
+        floatingMode?.hide(0L)
+    }
+
     private inner class Bridge {
         @JavascriptInterface
+        fun pause() {
+            mainHandler.post { pauseForScroll() }
+        }
+
+        @JavascriptInterface
         fun show(left: Double, top: Double, right: Double, bottom: Double,
-                 viewportWidth: Double, viewportHeight: Double) {
+                 viewportWidth: Double, viewportHeight: Double, editable: Boolean) {
+            // Discard a stale show which was queued before a new finger press.
+            val requestedEpoch = visibilityEpoch
             mainHandler.post {
-                if (findOnPage.isVisible) return@post
+                if (requestedEpoch != visibilityEpoch || findOnPage.isVisible) return@post
                 val view = page ?: return@post
                 if (!view.isAttachedToWindow || view.width <= 0 || view.height <= 0 ||
                     viewportWidth <= 0 || viewportHeight <= 0 ||
@@ -76,11 +118,17 @@ internal class SelectionToolbar(private val activity: MainActivity) {
                 host.getLocationOnScreen(hostLocation)
                 val dx = viewLocation[0] - hostLocation[0]
                 val dy = viewLocation[1] - hostLocation[1]
+                // The ActionMode menu is created once per selection type; a
+                // transition to/from an editable field needs new menu actions.
+                if (editableSelection != editable && floatingMode != null) finishToolbar()
+                editableSelection = editable
                 val next = Rect(x1 + dx, y1 + dy, x2 + dx, y2 + dy)
                 if (next != selectionRect) {
                     selectionRect.set(next)
                     floatingMode?.invalidateContentRect()
                 }
+                // Reveal only after the toolbar knows the text's new position.
+                resumeAfterScroll()
                 if (floatingMode == null) {
                     floatingMode = host.startActionMode(toolbarCallback, ActionMode.TYPE_FLOATING)
                 }
@@ -96,7 +144,11 @@ internal class SelectionToolbar(private val activity: MainActivity) {
     private val toolbarCallback = object : ActionMode.Callback2() {
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
             // Native Android decides which actions fit, and places the rest in its overflow menu.
-            menu.add(Menu.NONE, COPY, 0, "Copy").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
+            if (editableSelection) {
+                menu.add(Menu.NONE, CUT, 0, "Cut").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
+                menu.add(Menu.NONE, PASTE, 1, "Paste").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
+            }
+            menu.add(Menu.NONE, COPY, 2, "Copy").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
             menu.add(Menu.NONE, SHARE, 1, "Share").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
             menu.add(Menu.NONE, SELECT_ALL, 2, "Select all").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
             menu.add(Menu.NONE, SEARCH, 3, "Web search").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
@@ -140,6 +192,21 @@ internal class SelectionToolbar(private val activity: MainActivity) {
                     // WebView find session; otherwise its handles overlay matches.
                     dismissSelection()
                     page?.let { findOnPage.show(it, text) }
+                }
+                CUT -> withSelectedText { text ->
+                    if (editableSelection) {
+                        val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Selected text", text))
+                        replaceEditableText("")
+                    }
+                }
+                PASTE -> {
+                    if (editableSelection) {
+                        val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        val clip = clipboard.primaryClip
+                        val text = clip?.getItemAt(0)?.coerceToText(activity)?.toString()
+                        if (text != null) replaceEditableText(text)
+                    }
                 }
                 COPY, SHARE, SEARCH -> withSelectedText { text ->
                     if (text.isNotEmpty()) when (item.itemId) {
@@ -192,6 +259,18 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         }
     }
 
+    private fun replaceEditableText(text: String) {
+        // Proper JSON encoding prevents quotes, newlines and Unicode content
+        // from being interpreted as JavaScript when pasting clipboard text.
+        page?.evaluateJavascript(
+            "window.__kiTavernChatSelect && " +
+                "window.__kiTavernChatSelect.replaceSelection(${JSONObject.quote(text)});", null
+        )
+        // replaceSelection() closes the custom handles itself, and the native
+        // menu finishes without moving focus out of the real input element.
+        finishToolbar()
+    }
+
     private fun searchWeb(text: String) {
         val intent = Intent(Intent.ACTION_WEB_SEARCH).putExtra(SearchManager.QUERY, text)
         try {
@@ -212,6 +291,9 @@ internal class SelectionToolbar(private val activity: MainActivity) {
     }
 
     private fun finishToolbar() {
+        visibilityEpoch++
+        scrollPaused = false
+        mainHandler.removeCallbacks(keepToolbarHidden)
         val previous = floatingMode
         floatingMode = null
         previous?.finish()
