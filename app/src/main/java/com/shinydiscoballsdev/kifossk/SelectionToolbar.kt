@@ -18,6 +18,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.lang.ref.WeakReference
 import java.net.URLEncoder
 import kotlin.math.max
 import kotlin.math.min
@@ -57,14 +58,20 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         const val INTERFACE_NAME = "KiTavernSelectionToolbar"
     }
 
-    /** Rebinds the Javascript bridge after an Activity recreation with a retained WebView. */
+    /** Reuses the live page's bridge when rebinding a retained WebView. */
     fun attach(view: WebView) {
+        detach()
+        val bridge = (view.getTag(R.id.selection_toolbar_bridge) as? Bridge)
+            ?: Bridge().also {
+                view.addJavascriptInterface(it, INTERFACE_NAME)
+                view.setTag(R.id.selection_toolbar_bridge, it)
+            }
+        bridge.delegate?.get()?.detach()
         page = view
         // Host the contextual toolbar in the Activity, not the WebView. Using
         // WebView.startActionMode can interact with Chromium's own selection UI.
         toolbarHost = activity.findViewById(android.R.id.content)
-        view.removeJavascriptInterface(INTERFACE_NAME)
-        view.addJavascriptInterface(Bridge(), INTERFACE_NAME)
+        bridge.delegate = WeakReference(this)
     }
 
     /** Immediate UI-thread response to a new WebView touch, before JS scroll events. */
@@ -86,58 +93,79 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         floatingMode?.hide(0L)
     }
 
-    private inner class Bridge {
+    // WebView retains this object across Activities; only the current binding is weakly held.
+    private class Bridge {
+        @Volatile var delegate: WeakReference<SelectionToolbar>? = null
+
+        private fun forward(action: (SelectionToolbar, Int) -> Unit) {
+            val binding = delegate ?: return
+            val toolbar = binding.get() ?: return
+            val requestedEpoch = toolbar.visibilityEpoch
+            toolbar.mainHandler.post {
+                if (delegate !== binding) return@post
+                val current = binding.get() ?: return@post
+                if (current.page?.getTag(R.id.selection_toolbar_bridge) !== this) return@post
+                action(current, requestedEpoch)
+            }
+        }
+
         @JavascriptInterface
         fun pause() {
-            mainHandler.post { pauseForScroll() }
+            forward { toolbar, _ -> toolbar.pauseForScroll() }
         }
 
         @JavascriptInterface
         fun show(left: Double, top: Double, right: Double, bottom: Double,
                  viewportWidth: Double, viewportHeight: Double, editable: Boolean) {
-            // Discard a stale show which was queued before a new finger press.
-            val requestedEpoch = visibilityEpoch
-            mainHandler.post {
-                if (requestedEpoch != visibilityEpoch || findOnPage.isVisible) return@post
-                val view = page ?: return@post
-                if (!view.isAttachedToWindow || view.width <= 0 || view.height <= 0 ||
-                    viewportWidth <= 0 || viewportHeight <= 0 ||
-                    !UrlValidator.isValid(view.url)) return@post
-
-                val scaleX = view.width / viewportWidth
-                val scaleY = view.height / viewportHeight
-                val x1 = (left * scaleX).toInt().coerceIn(0, view.width)
-                val y1 = (top * scaleY).toInt().coerceIn(0, view.height)
-                val x2 = (right * scaleX).toInt().coerceIn(0, view.width)
-                val y2 = (bottom * scaleY).toInt().coerceIn(0, view.height)
-                if (x1 >= x2 || y1 >= y2) return@post
-                val host = toolbarHost ?: return@post
-                val viewLocation = IntArray(2)
-                val hostLocation = IntArray(2)
-                view.getLocationOnScreen(viewLocation)
-                host.getLocationOnScreen(hostLocation)
-                val dx = viewLocation[0] - hostLocation[0]
-                val dy = viewLocation[1] - hostLocation[1]
-                // The ActionMode menu is created once per selection type; a
-                // transition to/from an editable field needs new menu actions.
-                if (editableSelection != editable && floatingMode != null) finishToolbar()
-                editableSelection = editable
-                val next = Rect(x1 + dx, y1 + dy, x2 + dx, y2 + dy)
-                if (next != selectionRect) {
-                    selectionRect.set(next)
-                    floatingMode?.invalidateContentRect()
-                }
-                // Reveal only after the toolbar knows the text's new position.
-                resumeAfterScroll()
-                if (floatingMode == null) {
-                    floatingMode = host.startActionMode(toolbarCallback, ActionMode.TYPE_FLOATING)
-                }
+            forward { toolbar, requestedEpoch ->
+                toolbar.showToolbar(left, top, right, bottom, viewportWidth, viewportHeight,
+                    editable, requestedEpoch)
             }
         }
 
         @JavascriptInterface
         fun hide() {
-            mainHandler.post { finishToolbar() }
+            forward { toolbar, _ -> toolbar.finishToolbar() }
+        }
+    }
+
+    private fun showToolbar(left: Double, top: Double, right: Double, bottom: Double,
+                            viewportWidth: Double, viewportHeight: Double, editable: Boolean,
+                            requestedEpoch: Int) {
+        // Discard a stale show which was queued before a new finger press.
+        if (requestedEpoch != visibilityEpoch || findOnPage.isVisible) return
+        val view = page ?: return
+        if (!view.isAttachedToWindow || view.width <= 0 || view.height <= 0 ||
+            viewportWidth <= 0 || viewportHeight <= 0 ||
+            !UrlValidator.isValid(view.url)) return
+
+        val scaleX = view.width / viewportWidth
+        val scaleY = view.height / viewportHeight
+        val x1 = (left * scaleX).toInt().coerceIn(0, view.width)
+        val y1 = (top * scaleY).toInt().coerceIn(0, view.height)
+        val x2 = (right * scaleX).toInt().coerceIn(0, view.width)
+        val y2 = (bottom * scaleY).toInt().coerceIn(0, view.height)
+        if (x1 >= x2 || y1 >= y2) return
+        val host = toolbarHost ?: return
+        val viewLocation = IntArray(2)
+        val hostLocation = IntArray(2)
+        view.getLocationOnScreen(viewLocation)
+        host.getLocationOnScreen(hostLocation)
+        val dx = viewLocation[0] - hostLocation[0]
+        val dy = viewLocation[1] - hostLocation[1]
+        // The ActionMode menu is created once per selection type; a
+        // transition to/from an editable field needs new menu actions.
+        if (editableSelection != editable && floatingMode != null) finishToolbar()
+        editableSelection = editable
+        val next = Rect(x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+        if (next != selectionRect) {
+            selectionRect.set(next)
+            floatingMode?.invalidateContentRect()
+        }
+        // Reveal only after the toolbar knows the text's new position.
+        resumeAfterScroll()
+        if (floatingMode == null) {
+            floatingMode = host.startActionMode(toolbarCallback, ActionMode.TYPE_FLOATING)
         }
     }
 
@@ -180,36 +208,41 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         }
 
         override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
-            when (item.itemId) {
+            val view = page ?: return false
+            if (floatingMode !== mode) return false
+            val editable = editableSelection
+            val action = item.itemId
+            when (action) {
                 SELECT_ALL -> {
-                    page?.evaluateJavascript(
+                    visibilityEpoch++
+                    view.evaluateJavascript(
                         "window.__kiTavernChatSelect && window.__kiTavernChatSelect.selectAll();", null
                     )
                     return true
                 }
-                FIND_ON_PAGE -> withSelectedText { text ->
+                FIND_ON_PAGE -> withSelectedText(view, mode) { text ->
                     // Close our custom text selection before starting a normal
                     // WebView find session; otherwise its handles overlay matches.
-                    dismissSelection()
-                    page?.let { findOnPage.show(it, text) }
+                    dismissSelection(view)
+                    findOnPage.show(view, text)
                 }
-                CUT -> withSelectedText { text ->
-                    if (editableSelection) {
+                CUT -> withSelectedText(view, mode) { text ->
+                    if (editable && text.isNotEmpty()) {
                         val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         clipboard.setPrimaryClip(ClipData.newPlainText("Selected text", text))
-                        replaceEditableText("")
+                        replaceEditableText(view, "")
                     }
                 }
                 PASTE -> {
-                    if (editableSelection) {
+                    if (editable) {
                         val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         val clip = clipboard.primaryClip
                         val text = clip?.getItemAt(0)?.coerceToText(activity)?.toString()
-                        if (text != null) replaceEditableText(text)
+                        if (text != null) replaceEditableText(view, text)
                     }
                 }
-                COPY, SHARE, SEARCH -> withSelectedText { text ->
-                    if (text.isNotEmpty()) when (item.itemId) {
+                COPY, SHARE, SEARCH -> withSelectedText(view, mode) { text ->
+                    if (text.isNotEmpty()) when (action) {
                         COPY -> {
                             val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                             clipboard.setPrimaryClip(ClipData.newPlainText("Selected text", text))
@@ -223,18 +256,18 @@ internal class SelectionToolbar(private val activity: MainActivity) {
                         }
                         SEARCH -> searchWeb(text)
                     }
-                    dismissSelection()
+                    dismissSelection(view)
                 }
                 else -> {
-                    val target = processTargets[item.itemId] ?: return false
-                    withSelectedText { text ->
+                    val target = processTargets[action] ?: return false
+                    withSelectedText(view, mode) { text ->
                         if (text.isNotEmpty()) try {
                             activity.startActivity(Intent(target).apply {
                                 putExtra(Intent.EXTRA_PROCESS_TEXT, text)
                                 putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY, true)
                             })
                         } catch (_: ActivityNotFoundException) { /* Uninstalled since menu opened. */ }
-                        dismissSelection()
+                        dismissSelection(view)
                     }
                 }
             }
@@ -248,21 +281,25 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         }
     }
 
-    private fun withSelectedText(callback: (String) -> Unit) {
-        val view = page ?: return
+    private fun withSelectedText(view: WebView, mode: ActionMode, callback: (String) -> Unit) {
+        val requestedEpoch = visibilityEpoch
         view.evaluateJavascript(
             "window.__kiTavernChatSelect ? window.__kiTavernChatSelect.selectedText() : '';"
         ) { result ->
-            val text = try { JSONTokener(result).nextValue() as? String ?: "" }
-            catch (_: Exception) { "" }
+            if (page !== view || floatingMode !== mode || requestedEpoch != visibilityEpoch) {
+                return@evaluateJavascript
+            }
+            val text = try { JSONTokener(result).nextValue() as? String }
+            catch (_: Exception) { null }
+            if (text == null) return@evaluateJavascript
             callback(text)
         }
     }
 
-    private fun replaceEditableText(text: String) {
+    private fun replaceEditableText(view: WebView, text: String) {
         // Proper JSON encoding prevents quotes, newlines and Unicode content
         // from being interpreted as JavaScript when pasting clipboard text.
-        page?.evaluateJavascript(
+        view.evaluateJavascript(
             "window.__kiTavernChatSelect && " +
                 "window.__kiTavernChatSelect.replaceSelection(${JSONObject.quote(text)});", null
         )
@@ -283,9 +320,9 @@ internal class SelectionToolbar(private val activity: MainActivity) {
         }
     }
 
-    private fun dismissSelection() {
+    private fun dismissSelection(view: WebView) {
         finishToolbar()
-        page?.evaluateJavascript(
+        view.evaluateJavascript(
             "window.__kiTavernChatSelect && window.__kiTavernChatSelect.dismiss();", null
         )
     }
@@ -302,13 +339,25 @@ internal class SelectionToolbar(private val activity: MainActivity) {
     fun dismissOnBack(): Boolean {
         if (findOnPage.dismiss()) return true
         if (floatingMode == null) return false
-        dismissSelection()
+        val view = page ?: return false
+        dismissSelection(view)
         return true
     }
 
-    fun detach() {
+    /** Closes both native UIs and invalidates pending work, even without a visible toolbar. */
+    fun resetForNavigation() {
+        val bridge = page?.getTag(R.id.selection_toolbar_bridge) as? Bridge
+        // A new binding token rejects queued hide/pause as well as show calls.
+        if (bridge != null && bridge.delegate?.get() === this) bridge.delegate = WeakReference(this)
         findOnPage.dismiss()
         finishToolbar()
+        mainHandler.removeCallbacksAndMessages(null)
+    }
+
+    fun detach() {
+        val bridge = page?.getTag(R.id.selection_toolbar_bridge) as? Bridge
+        if (bridge != null && bridge.delegate?.get() === this) bridge.delegate = null
+        resetForNavigation()
         page = null
         toolbarHost = null
     }

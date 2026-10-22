@@ -1,7 +1,7 @@
 /* Chat-first touch text selection for Android WebView.
  * SillyTavern's #chat is preferred when present. Other ordinary page text,
  * including visible menu/dialog labels, uses the same handles and toolbar.
- * Ordinary editable fields share the custom handles; passwords, special
+ * Text fields, including readonly fields, share the custom handles; passwords, special
  * controls and links retain native editing/long-press behaviour.
  * Uses Android's floating ActionMode through a tiny Kotlin bridge; no extra engine.
  */
@@ -40,11 +40,11 @@
         '::highlight(' + HIGHLIGHT_NAME + '){background-color:rgba(33,150,243,.30);}' +
         '#__kiChatSelectOverlay{position:fixed;inset:0;z-index:2147483640;' +
         'pointer-events:none;font-family:Roboto,Arial,sans-serif;}' +
-        '#__kiChatSelectOverlay .ki-chat-select-mark{position:fixed;' +
+        '#__kiChatSelectOverlay .ki-chat-select-mark{position:absolute;' +
         'background:rgba(33,150,243,.30);pointer-events:none;border-radius:1px;}' +
         // Mirror native input/textarea text geometry only during field selection.
         // The mirror never receives touches and does not modify field values.
-        '#__kiChatSelectOverlay .ki-field-mirror{position:fixed;' +
+        '#__kiChatSelectOverlay .ki-field-mirror{position:absolute;' +
         'box-sizing:border-box;overflow:hidden;pointer-events:none;' +
         'color:transparent!important;-webkit-text-fill-color:transparent!important;}' +
         '.' + TOUCH_LOCK + ' input.__kiFieldSelectActive, ' +
@@ -55,6 +55,7 @@
         '.ki-chat-select-scroll-host .ki-chat-select-handle{' +
         'position:fixed;width:34px;height:44px;margin-left:-17px;touch-action:none;' +
         'pointer-events:auto;-webkit-tap-highlight-color:transparent;}' +
+        '#__kiChatSelectOverlay .ki-chat-select-handle{position:absolute;}' +
         // For ordinary finger scrolling, place handles in the same scrolled
         // content layer as the selected text. Chromium composites them together
         // rather than waiting for our next main-thread scroll/animation frame.
@@ -94,6 +95,9 @@
     var correctedExternalScrolls = 0;
     var recentFieldTouch = null;
     var fieldSelectReentry = false;
+    var touchSequence = 0;
+    var activePressToken = 0;
+    var androidPress = null;
     // During an ordinary scroll, project the last *real caret* positions using
     // the selected container's movement; remeasure once the motion settles.
     // This avoids WebView compositor lag and edge-clamped handle drift.
@@ -133,10 +137,10 @@
         return (css.overflowY === 'auto' || css.overflowY === 'scroll') &&
             el.scrollHeight > el.clientHeight + 2 && el.clientHeight > 20;
     }
-    function editableFieldFor(target) {
+    function selectableFieldFor(target) {
         if (!target || !target.closest) return null;
         var field = target.closest('input,textarea');
-        if (!field || field.disabled || field.readOnly ||
+        if (!field || field.disabled ||
             field.closest('[inert],[hidden],[aria-hidden="true"]')) return null;
         if (field.tagName === 'INPUT' &&
             ['text','search','url','email','tel'].indexOf(field.type) < 0) return null;
@@ -147,7 +151,7 @@
         return css.display === 'none' || css.visibility === 'hidden' ? null : field;
     }
     function areaFor(target) {
-        var field = editableFieldFor(target);
+        var field = selectableFieldFor(target);
         if (field) return {root:field, scroll:field, field:field, chat:false};
         if (!target || !target.closest || target.closest(EXCLUDE)) return null;
         // Labels tied to form controls should keep native focus/edit handling.
@@ -178,7 +182,7 @@
         return {root:root, scroll:DOCUMENT_SCROLL, chat:false};
     }
 
-    function viewportBox(area) {
+    function viewportBox(area, outsideField) {
         var vv = window.visualViewport;
         var left = vv ? vv.offsetLeft : 0;
         var top = vv ? vv.offsetTop : 0;
@@ -186,7 +190,7 @@
         var bottom = vv ? top + vv.height : window.innerHeight;
         // Intersect with the selected container and every clipping ancestor.
         // Document scrolling has a viewport, not a usable document-element rect.
-        var el = area.root;
+        var el = outsideField && area.field ? area.root.parentElement : area.root;
         while (el && el !== document.documentElement) {
             var css = getComputedStyle(el);
             var clips = el === area.root || el === area.scroll ||
@@ -277,10 +281,16 @@
                 Math.min(box.right - 17, r.left));
             var top = Math.max(box.top,
                 Math.min(box.bottom - 40, r.bottom - 2));
+            if (session.area.field) {
+                var handleBox = viewportBox(session.area, true);
+                left = Math.max(handleBox.left + 17, Math.min(handleBox.right - 17, r.left));
+                top = Math.max(handleBox.top, Math.min(handleBox.bottom - 40, r.bottom - 2));
+            }
+            var aligned = overlayCoordinates(session, left, top);
             handle.style.display = 'block';
             handle.style.transform = 'translate3d(' +
-                (left - base.handles[i].left) + 'px,' +
-                (top - base.handles[i].top) + 'px,0)';
+                (aligned.x - base.handles[i].left) + 'px,' +
+                (aligned.y - base.handles[i].top) + 'px,0)';
         });
         // The old-WebView fallback draws its own highlight rectangles; those
         // shouldn't stay frozen in screen space during a kinetic scroll.
@@ -482,7 +492,8 @@
         lastToolbarUpdate = now;
         session.nativeToolbarVisible = true;
         bridge.show(r.left, r.top, r.right, r.bottom,
-            window.innerWidth, window.innerHeight, !!session.area.field);
+            window.innerWidth, window.innerHeight,
+            !!(session.area.field && !session.area.field.readOnly && !session.area.field.disabled));
     }
     function scheduleToolbarFor(current, delay) {
         if (toolbarTimer) clearTimeout(toolbarTimer);
@@ -522,33 +533,52 @@
     // A textarea's value is not a DOM text node. During selection, mirror its
     // *text layout* in a transparent, clipped element so DOM Ranges can locate
     // characters without changing the actual editor, selection or keyboard.
+    function overlayCoordinates(current, x, y) {
+        // Modal transforms change the containing block. All overlay children
+        // use this one coordinate system, including during popup animations.
+        var overlay = current.overlay;
+        var bounds = overlay.getBoundingClientRect();
+        var scaleX = overlay.offsetWidth ? bounds.width / overlay.offsetWidth : 1;
+        var scaleY = overlay.offsetHeight ? bounds.height / overlay.offsetHeight : 1;
+        return {x:(x - bounds.left) / (scaleX || 1),
+            y:(y - bounds.top) / (scaleY || 1)};
+    }
     function syncFieldMirror(current) {
         if (!current || !current.area.field || !current.mirror) return;
         var field = current.area.field;
         var mirror = current.mirror;
-        if (!field.isConnected || mirror.firstChild !== current.mirrorText ||
-            field.value !== current.mirrorText.data) {
-            if (field.value !== current.mirrorText.data) {
-                // A real edit occurred; don't leave stale handles on old text.
-                closeSelection();
-            }
+        if (selectableFieldFor(field) !== field || !field.isConnected ||
+            mirror.firstChild !== current.mirrorText || field.value !== current.mirrorText.data) {
+            closeSelection();
             return;
         }
         var rect = field.getBoundingClientRect(), css = getComputedStyle(field);
-        mirror.style.left = rect.left + 'px';
-        mirror.style.top = rect.top + 'px';
-        mirror.style.width = rect.width + 'px';
-        mirror.style.height = rect.height + 'px';
+        var origin = overlayCoordinates(current, rect.left, rect.top);
+        // offsetWidth/Height are untransformed border-box dimensions. The
+        // mirror may be outside a scaled inner panel in the same dialog.
+        var width = field.offsetWidth, height = field.offsetHeight;
+        if (!width || !height || !rect.width || !rect.height) { closeSelection(); return; }
+        var other = overlayCoordinates(current, rect.right, rect.bottom);
+        mirror.style.left = origin.x + 'px';
+        mirror.style.top = origin.y + 'px';
+        mirror.style.width = width + 'px';
+        mirror.style.height = height + 'px';
+        mirror.style.transformOrigin = '0 0';
+        mirror.style.transform = 'scale(' + ((other.x - origin.x) / width) + ',' +
+            ((other.y - origin.y) / height) + ')';
         ['font','letterSpacing','wordSpacing','lineHeight','textAlign','direction',
          'textIndent','tabSize','paddingTop','paddingRight','paddingBottom','paddingLeft',
          'borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth',
-         'boxSizing','textTransform','writingMode'].forEach(function(prop) {
+         'textTransform','writingMode','wordBreak','fontKerning',
+         'fontFeatureSettings','fontVariantCaps','fontVariationSettings'].forEach(function(prop) {
             mirror.style[prop] = css[prop];
         });
+        mirror.style.boxSizing = 'border-box';
         mirror.style.borderStyle = 'solid';
         mirror.style.borderColor = 'transparent';
-        mirror.style.whiteSpace = field.tagName === 'TEXTAREA' ? 'pre-wrap' : 'pre';
-        mirror.style.overflowWrap = field.tagName === 'TEXTAREA' ? 'break-word' : 'normal';
+        var wraps = field.tagName === 'TEXTAREA' && field.wrap !== 'off';
+        mirror.style.whiteSpace = wraps ? 'pre-wrap' : 'pre';
+        mirror.style.overflowWrap = wraps ? 'break-word' : 'normal';
         mirror.style.overflow = 'hidden';
         mirror.scrollTop = field.scrollTop;
         mirror.scrollLeft = field.scrollLeft;
@@ -565,7 +595,7 @@
         var range = document.createRange();
         // Only visible character rectangles are candidates. This also handles
         // wrapped textarea lines and horizontal scrolling in single-line inputs.
-        var best = 0, bestDistance = Infinity;
+        var best = null, bestDistance = Infinity;
         var length = text.length;
         // Avoid measuring thousands of individual glyphs on every drag frame.
         // Check a coarse sample first, then examine its surrounding characters.
@@ -587,7 +617,7 @@
             for (var n = 0; n < length; n += step) {
                 range.setStart(text, n); range.setEnd(text, n + 1);
                 var cr = range.getBoundingClientRect();
-                if (!cr.height || cr.bottom < box.top || cr.top > box.bottom) continue;
+                if (!cr.height) continue;
                 var ddy = y < cr.top ? cr.top - y : y > cr.bottom ? y - cr.bottom : 0;
                 var ddx = x < cr.left ? cr.left - x : x > cr.right ? x - cr.right : 0;
                 var distance = ddy * 10 + ddx;
@@ -597,7 +627,7 @@
         var from = step > 1 ? Math.max(0, coarseBest - step * 2) : 0;
         var to = step > 1 ? Math.min(length, coarseBest + step * 2 + 1) : length;
         for (var i = from; i < to; i++) inspect(i);
-        return {node:text, offset:best};
+        return best === null ? null : {node:text, offset:best};
     }
     function fromXY(area, x, y) {
         if (area.field) return fieldPoint(area, x, y);
@@ -707,9 +737,10 @@
         if (text !== undefined) el.textContent = text;
         return el;
     }
-    function buildOverlay() {
+    function buildOverlay(area) {
         var overlay = document.createElement('div');
         overlay.id = '__kiChatSelectOverlay';
+        overlay.setAttribute('aria-hidden', 'true');
         var marks = make('div', 'ki-chat-select-marks');
         var startHandle = make('div', HANDLE_CLASS + ' ki-chat-select-handle');
         var endHandle = make('div', HANDLE_CLASS + ' ki-chat-select-handle');
@@ -720,7 +751,16 @@
         overlay.appendChild(marks);
         overlay.appendChild(startHandle);
         overlay.appendChild(endHandle);
-        document.documentElement.appendChild(overlay);
+        // A z-index cannot escape a modal's top layer or its inert backdrop.
+        // Use the nearest active host, including popovers nested in dialogs.
+        var host = area.root;
+        while (host && host !== document.documentElement) {
+            var topLayer = host.matches('dialog[open]') || host === document.fullscreenElement;
+            try { topLayer = topLayer || host.matches(':popover-open'); } catch (_) {}
+            if (topLayer) break;
+            host = host.parentElement;
+        }
+        (host || document.documentElement).appendChild(overlay);
         startHandle.addEventListener('touchstart', beginHandle, {passive:false});
         endHandle.addEventListener('touchstart', beginHandle, {passive:false});
         startHandle.addEventListener('pointerdown', beginMouseHandle);
@@ -761,29 +801,41 @@
         return {x: screenX * window.innerWidth / physicalWidth,
             y: screenY * window.innerHeight / physicalHeight};
     }
-    function probeAndroid(screenX, screenY, physicalWidth, physicalHeight) {
+    function probeAndroid(screenX, screenY, physicalWidth, physicalHeight, gestureId) {
         var p = androidPoint(screenX, screenY, physicalWidth, physicalHeight);
-        if (!p) return false;
-        var target = document.elementFromPoint(p.x, p.y);
-        return !!(target && eligible(target, p.x, p.y));
+        var target = p && document.elementFromPoint(p.x, p.y);
+        var area = target && eligible(target, p.x, p.y);
+        androidPress = area ? {area:area, x:p.x, y:p.y, gestureId:gestureId,
+            fieldRect:area.field ? area.field.getBoundingClientRect() : null} : null;
+        return !!area;
+    }
+    function pressCoordinates(press) {
+        var rect = press.area.field && press.area.field.getBoundingClientRect();
+        return {x:press.x + (rect && press.fieldRect ? rect.left - press.fieldRect.left : 0),
+            y:press.y + (rect && press.fieldRect ? rect.top - press.fieldRect.top : 0)};
     }
     // Android's own long-click gesture takes precedence over a native
     // Chromium selection, but only if the ACTION_DOWN preflight succeeded.
-    function androidLongPress(screenX, screenY, physicalWidth, physicalHeight) {
-        if (!physicalWidth || !physicalHeight) return false;
-        // A previous chat/menu selection must never swallow a new field long
-        // press. beginSelection() closes it and starts fresh at the new target.
-        var p = androidPoint(screenX, screenY, physicalWidth, physicalHeight);
-        if (!p) return false;
-        var x = p.x, y = p.y;
-        var target = document.elementFromPoint(x, y);
-        var area = target && eligible(target, x, y);
-        if (!area) return false;
+    function androidLongPress(screenX, screenY, physicalWidth, physicalHeight, gestureId) {
+        if (!androidPress || androidPress.gestureId !== gestureId) return false;
+        // The DOM timer may already own this exact physical press. Do not
+        // re-hit-test against its new overlay or rebuild its selected range.
+        if (session && activePressToken && session.initiatingPressToken === activePressToken) {
+            session.androidGestureId = gestureId;
+            session.waitingForRelease = 'android';
+            return true;
+        }
+        var press = pending || androidPress;
+        var area = press.area;
+        if (!area.root.isConnected ||
+            (area.field && selectableFieldFor(area.field) !== area.field)) return false;
+        var p = pressCoordinates(press);
         stopPending();
-        beginSelection(area, x, y, null);
+        beginSelection(area, p.x, p.y, null);
         // The original finger may still be down. Show the toolbar after
         // release (or after a short fallback if WebView eats touchend).
-        if (session) {
+        if (session && session.area.root === area.root) {
+            session.androidGestureId = gestureId;
             session.waitingForRelease = 'android';
             return true;
         }
@@ -793,18 +845,32 @@
     // Android's own long-click can consume touchend before it reaches the page.
     // In that case MainActivity reports ACTION_UP explicitly. Never open the
     // native toolbar while the initiating finger is still touching the screen.
-    function androidPressReleased() {
-        if (!session || session.waitingForRelease !== 'android') return;
-        session.waitingForRelease = null;
-        scheduleToolbarFor(session, 140);
-    }
-    function androidPressCanceled() {
-        if (session && session.waitingForRelease === 'android') {
+    function androidPressReleased(gestureId) {
+        if (!androidPress || androidPress.gestureId !== gestureId) return;
+        androidPress = null;
+        stopPending();
+        activePressToken = 0;
+        if (recentFieldTouch) recentFieldTouch.releasedAt = performance.now();
+        if (session && session.androidGestureId === gestureId && session.waitingForRelease !== null) {
             session.waitingForRelease = null;
+            scheduleToolbarFor(session, 140);
+        }
+    }
+    function androidPressCanceled(gestureId) {
+        if (!androidPress || androidPress.gestureId !== gestureId) return;
+        androidPress = null;
+        stopPending();
+        activePressToken = 0;
+        recentFieldTouch = null;
+        if (session && session.androidGestureId === gestureId && session.waitingForRelease !== null) {
+            session.waitingForRelease = null;
+            scheduleToolbarFor(session, 140);
         }
     }
 
     function beginSelection(area, x, y, touchId, fieldOffsets) {
+        if (session && activePressToken && session.initiatingPressToken === activePressToken &&
+            session.area.root === area.root) return;
         // Build the mirror before resolving a field's word location. Its text
         // node is independent from the actual input value and never edits it.
         if (!area.field) {
@@ -813,10 +879,15 @@
         }
         closeSelection();
         tapCandidate = null;
-        var ui = buildOverlay();
+        var ui = buildOverlay(area);
         session = Object.assign({area:area, start:null, end:null,
+            initiatingPressToken:activePressToken,
+            initiatingTouchId:area.field && recentFieldTouch && recentFieldTouch.field === area.field ?
+                recentFieldTouch.id : touchId,
+            androidGestureId:androidPress ? androidPress.gestureId : null,
             waitingForRelease:touchId, nativeToolbarVisible:false}, ui);
         if (area.field) {
+            recentFieldTouch = null;
             session.mirror = make('div', 'ki-field-mirror');
             session.mirrorText = document.createTextNode(area.field.value);
             session.mirror.appendChild(session.mirrorText);
@@ -872,16 +943,25 @@
                 if (session !== current || drag) return;
                 // Handle positioning itself changes style attributes. Ignore
                 // those mutations to avoid triggering a redraw feedback loop.
-                if (current.handleHost && records.every(function (record) {
-                    return current.handleHost.contains(record.target);
+                if (records.every(function (record) {
+                    return current.overlay.contains(record.target) ||
+                        (current.handleHost && current.handleHost.contains(record.target));
                 })) return;
                 if (current.handleHost) scheduleDraw();
                 else beginMotion();
             });
             current.layoutObserver.observe(current.area.root, {
                 subtree:true, childList:true, characterData:true, attributes:true,
-                attributeFilter:['class', 'style', 'hidden']
+                attributeFilter:['class', 'style', 'hidden', 'open', 'inert', 'aria-hidden', 'disabled']
             });
+            // Field size can stay unchanged while an enclosing options panel
+            // moves, closes, or is removed. Observe ancestors, not their subtrees.
+            for (var el = current.area.root.parentElement; el; el = el.parentElement) {
+                current.layoutObserver.observe(el, {
+                    childList:true, attributes:true,
+                    attributeFilter:['class', 'style', 'hidden', 'open', 'inert', 'aria-hidden']
+                });
+            }
         }
     }
     function showHandle(handle, point, box) {
@@ -904,10 +984,12 @@
             return rect;
         }
         handle.style.display = 'block';
-        handle.style.left = Math.max(box.left + 17,
-            Math.min(box.right - 17, rect.left)) + 'px';
-        handle.style.top = Math.max(box.top,
-            Math.min(box.bottom - 40, rect.bottom - 2)) + 'px';
+        var handleBox = session.area.field ? viewportBox(session.area, true) : box;
+        var aligned = overlayCoordinates(session,
+            Math.max(handleBox.left + 17, Math.min(handleBox.right - 17, rect.left)),
+            Math.max(handleBox.top, Math.min(handleBox.bottom - 40, rect.bottom - 2)));
+        handle.style.left = aligned.x + 'px';
+        handle.style.top = aligned.y + 'px';
         return rect;
     }
     function draw() {
@@ -926,7 +1008,7 @@
         var r = selectedRange();
         if (!r) { closeSelection(); return; }
         var box = viewportBox(area);
-        if (box.width < 20 || box.height < 20) { closeSelection(); return; }
+        if (box.width < 20 || box.height < (area.field ? 18 : 20)) { closeSelection(); return; }
         if (session.nativeHighlight) {
             // Only update the highlight when the endpoints change. Scroll alone
             // moves the native highlight automatically; no per-frame DOM churn.
@@ -974,10 +1056,12 @@
                 }
                 if (redundant) continue;
                 var mark = make('div', 'ki-chat-select-mark');
-                mark.style.left = outer.left + 'px';
-                mark.style.top = outer.top + 'px';
-                mark.style.width = (outer.right - outer.left) + 'px';
-                mark.style.height = (outer.bottom - outer.top) + 'px';
+                var origin = overlayCoordinates(session, outer.left, outer.top);
+                var other = overlayCoordinates(session, outer.right, outer.bottom);
+                mark.style.left = origin.x + 'px';
+                mark.style.top = origin.y + 'px';
+                mark.style.width = (other.x - origin.x) + 'px';
+                mark.style.height = (other.y - origin.y) + 'px';
                 frag.appendChild(mark);
                 count++;
             }
@@ -1205,10 +1289,15 @@
             var range = selectedRange();
             return range ? range.toString() : '';
         },
-        isEditableSelection:function () { return !!(session && session.area.field); },
+        isEditableSelection:function () {
+            return !!(session && session.area.field &&
+                !session.area.field.readOnly && !session.area.field.disabled);
+        },
         replaceSelection:function (value) {
             if (!session || !session.area.field || typeof value !== 'string') return false;
             var field = session.area.field;
+            if (!field.isConnected || field.readOnly || field.disabled ||
+                field.value !== session.mirrorText.data) return false;
             var start = session.start.offset, end = session.end.offset;
             // setRangeText changes the live field and retains a valid caret.
             // Dispatch input so SillyTavern/framework state receives the edit.
@@ -1225,16 +1314,23 @@
         scrollbarTouchStarted:scrollbarTouchStarted,
         scrollbarTouchFinished:scrollbarTouchFinished,
         status:function () {
-            return {installed:true, version:4, active:!!session,
+            return {installed:true, version:5, active:!!session,
                 correctedExternalScrolls:correctedExternalScrolls,
                 chat:!!document.getElementById('chat')};
         }
     };
 
     document.addEventListener('touchstart', function (e) {
-        if (e.touches.length !== 1) { stopPending(); tapCandidate = null; return; }
+        if (e.touches.length !== 1) {
+            activePressToken = 0; recentFieldTouch = null;
+            stopPending(); tapCandidate = null; return;
+        }
+        activePressToken = ++touchSequence;
         if (drag || window.__kiTavernScrollbarDragging ||
-            (e.target.closest && e.target.closest('.' + HANDLE_CLASS))) return;
+            (e.target.closest && e.target.closest('.' + HANDLE_CLASS))) {
+            recentFieldTouch = null;
+            return;
+        }
         stopPending();
         toolbarTouchStarted();
         var t = e.changedTouches[0];
@@ -1242,18 +1338,22 @@
         // Only allow native-to-custom input handoff for a recent real touch;
         // programmatic select() calls made by SillyTavern must stay untouched.
         recentFieldTouch = area && area.field ?
-            {field:area.field, time:performance.now(), x:t.clientX, y:t.clientY} : null;
+            {field:area.field, id:t.identifier, time:performance.now(),
+                x:t.clientX, y:t.clientY, releasedAt:null} : null;
         // Don't clear an existing selection on ACTION_DOWN: this gesture might
         // turn into scrolling. Only dismiss it after an actual tap (on release).
         tapCandidate = session ? {id:t.identifier, x:t.clientX, y:t.clientY} : null;
         if (!area) return;
         lock(area);
         pending = {area:area, id:t.identifier, x:t.clientX, y:t.clientY,
+            time:performance.now(),
+            fieldRect:area.field ? area.field.getBoundingClientRect() : null,
             timer:setTimeout(function () {
                 if (!pending || !area.root.isConnected) return;
-                var x = pending.x, y = pending.y, id = pending.id;
+                var p = pressCoordinates(pending), id = pending.id;
                 stopPending();
-                beginSelection(area, x, y, id);
+                if (!area.field || selectableFieldFor(area.field) === area.field)
+                    beginSelection(area, p.x, p.y, id);
             }, 390)};
     }, {capture:true, passive:true});
     document.addEventListener('touchmove', function (e) {
@@ -1268,6 +1368,17 @@
                 break;
             }
         }
+        if (recentFieldTouch) {
+            for (var k = 0; k < e.changedTouches.length; k++) {
+                var moved = e.changedTouches[k];
+                if (moved.identifier === recentFieldTouch.id &&
+                    (Math.abs(moved.clientX - recentFieldTouch.x) > 9 ||
+                     Math.abs(moved.clientY - recentFieldTouch.y) > 9)) {
+                    recentFieldTouch = null;
+                    break;
+                }
+            }
+        }
         if (!pending) return;
         for (var i = 0; i < e.changedTouches.length; i++) {
             var t = e.changedTouches[i];
@@ -1278,6 +1389,15 @@
         }
     }, {capture:true, passive:false});
     document.addEventListener('touchend', function (e) {
+        if (session && session.area.field && session.initiatingPressToken === activePressToken &&
+            activePressToken && e.cancelable) {
+            for (var nativeIndex = 0; nativeIndex < e.changedTouches.length; nativeIndex++) {
+                if (e.changedTouches[nativeIndex].identifier === session.initiatingTouchId) {
+                    e.preventDefault();
+                    break;
+                }
+            }
+        }
         if (session && session.waitingForRelease !== null &&
             session.waitingForRelease !== undefined) {
             for (var i = 0; i < e.changedTouches.length; i++) {
@@ -1293,6 +1413,15 @@
         }
         endDrag(e, 'touch');
         toolbarTouchFinished();
+        if (recentFieldTouch) {
+            for (var k = 0; k < e.changedTouches.length; k++) {
+                if (e.changedTouches[k].identifier === recentFieldTouch.id) {
+                    if (performance.now() - recentFieldTouch.time < 300) recentFieldTouch = null;
+                    else recentFieldTouch.releasedAt = performance.now();
+                    break;
+                }
+            }
+        }
         if (tapCandidate) {
             for (var j = 0; j < e.changedTouches.length; j++) {
                 if (e.changedTouches[j].identifier === tapCandidate.id) {
@@ -1309,18 +1438,37 @@
                 }
             }
         }
-    }, true);
+        if (!e.touches.length) activePressToken = 0;
+    }, {capture:true, passive:false});
     document.addEventListener('touchcancel', function (e) {
         endDrag(e, 'touch'); toolbarTouchFinished();
         stopPending(); tapCandidate = null;
-        recentFieldTouch = null;
+        recentFieldTouch = null; activePressToken = 0;
+        if (session && session.waitingForRelease !== null) {
+            session.waitingForRelease = null;
+            scheduleToolbarFor(session, 140);
+        }
+    }, true);
+    document.addEventListener('selectstart', function (e) {
+        var target = e.target && (e.target.nodeType === 3 ? e.target.parentElement : e.target);
+        var field = selectableFieldFor(target);
+        if (field && e.cancelable &&
+            ((pending && pending.area.field === field && performance.now() - pending.time >= 300) ||
+             (session && session.area.field === field &&
+              (!activePressToken || session.initiatingPressToken === activePressToken))))
+            e.preventDefault();
+    }, true);
+    document.addEventListener('selectionchange', function () {
+        if (session && session.area.field && !fieldSelectReentry &&
+            !(recentFieldTouch && recentFieldTouch.field === session.area.field))
+            collapseNativeFieldSelection(session.area.field);
     }, true);
     // If Chromium consumes a field long press before our timer, its native
     // selection still produces a `select` event on ordinary input controls.
     // Convert that one range to our own handles and clear Chromium's range.
     document.addEventListener('select', function (e) {
         if (fieldSelectReentry) return;
-        var field = editableFieldFor(e.target);
+        var field = selectableFieldFor(e.target);
         if (!field) return;
         var press = recentFieldTouch;
         var age = press ? performance.now() - press.time : Infinity;
@@ -1329,16 +1477,16 @@
         // even another selection in this same field. Ignore programmatic
         // select() calls and ordinary taps made while focusing an input.
         if (!press || press.field !== field || age < 300 || age > 2600 ||
+            (press.releasedAt !== null && performance.now() - press.releasedAt > 250) ||
             typeof start !== 'number' || typeof end !== 'number' || end <= start) {
             if (session && session.area.field === field)
                 collapseNativeFieldSelection(field);
             return;
         }
-        recentFieldTouch = null;
         stopPending();
         beginSelection({root:field,scroll:field,field:field,chat:false},
-            press.x, press.y, null, {start:start,end:end});
-        if (session && session.area.field === field)
+            press.x, press.y, press.releasedAt === null ? press.id : null, {start:start,end:end});
+        if (session && session.area.field === field && press.releasedAt !== null)
             scheduleToolbarFor(session, 130);
     }, true);
     // Only one selection may be active. Even unsupported native editors (such
@@ -1362,7 +1510,7 @@
         if (e.target.closest &&
             (e.target.closest('.' + TOUCH_LOCK) ||
              e.target.closest('.' + HANDLE_CLASS) ||
-             (session && session.area.field === editableFieldFor(e.target))))
+              (session && session.area.field === selectableFieldFor(e.target))))
             e.preventDefault();
     }, true);
     window.addEventListener('scroll', function (event) {
@@ -1388,5 +1536,5 @@
     // A floating Android ActionMode can move window focus temporarily.
     // Losing focus must not discard the selected range or its handles.
     window.addEventListener('blur', stopPending);
-    return 'selection-v3';
+    return 'selection-v5';
 })();
