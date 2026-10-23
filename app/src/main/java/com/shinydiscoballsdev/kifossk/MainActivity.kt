@@ -51,7 +51,6 @@ import java.net.URLEncoder
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
-    private val selectionToolbar by lazy { SelectionToolbar(this) }
     private lateinit var container: FrameLayout
     // A native ACTION_DOWN can reach us before Chromium's compositor takes the
     // scrollbar gesture. Keep a passive snapshot of the *actual thumb bounds*
@@ -172,7 +171,6 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (selectionToolbar.dismissOnBack()) return
                 if (settingsFragment != null) closeSettings() else showSettings()
             }
         })
@@ -613,7 +611,7 @@ class MainActivity : AppCompatActivity() {
             installKeyboardLift(webView)
             updateChatFocusPolicy(webView)
             installScrollbarDrag(webView)
-            installChatTextSelection(webView)
+            installNativeSelectionBoundaries(webView)
         }
 
         // If this is a configuration/recreation hand-off, keep the same WebView object
@@ -707,18 +705,10 @@ class MainActivity : AppCompatActivity() {
                 view.tag = it
                 view.addJavascriptInterface(it, "KiTavernScrollbarTouch")
             }
-        selectionToolbar.attach(view)
 
-        // Resolve whether this press is on selectable page text *before* Android's
-        // long-click callback. Returning true for that gesture prevents Chromium
-        // from starting a second, competing set of native selection handles.
-        // Links, input fields and unknown/unready pages retain normal behaviour.
-        val touchSlop = android.view.ViewConfiguration.get(this).scaledTouchSlop
-        var gestureSequence = 0
-        var downX = -1f
-        var downY = -1f
-        var customLongPressEligible = false
-        var customLongPressInProgress = false
+        // Keep Chromium's built-in text selection and native Android handles.
+        // Only the existing dedicated scrollbar-thumb gesture is intercepted;
+        // every other touch/long press goes directly to WebView.
         var nativeScrollbarTouch = false
         var nativeScrollbarPointerId = -1
         var nativeScrollbarY = 0f
@@ -760,12 +750,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
         view.setOnTouchListener { _, event ->
-            // Pause the native floating selection toolbar before Chromium's
-            // compositor begins a touch scroll. The JS touchstart/scroll event
-            // can otherwise arrive a frame late and leave the popup visible.
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                selectionToolbar.pauseForScroll()
-            }
             // Intercept at the Android View boundary *before* Chromium can claim
             // the native scrollbar drag on the compositor. Otherwise it may
             // move without our blue pressed state and race the JS scroll guard.
@@ -799,9 +783,6 @@ class MainActivity : AppCompatActivity() {
             if (event.actionMasked == MotionEvent.ACTION_DOWN && event.pointerCount == 1) {
                 val hit = thumbPress(event)
                 if (hit != null) {
-                    ++gestureSequence
-                    customLongPressEligible = false
-                    customLongPressInProgress = false
                     nativeScrollbarTouch = true
                     nativeScrollbarPointerId = event.getPointerId(0)
                     nativeScrollbarScope = hit.scope
@@ -818,66 +799,7 @@ class MainActivity : AppCompatActivity() {
                     return@setOnTouchListener true
                 }
             }
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    customLongPressInProgress = false
-                    downX = event.x
-                    downY = event.y
-                    customLongPressEligible = false
-                    val sequence = ++gestureSequence
-                    if (UrlValidator.isValid(view.url) && view.width > 0 && view.height > 0) {
-                        val script = "window.__kiTavernChatSelect ? " +
-                            "window.__kiTavernChatSelect.probeAt(" +
-                            "${downX.toInt()},${downY.toInt()},${view.width},${view.height}) : false"
-                        view.evaluateJavascript(script) { result ->
-                            if (sequence == gestureSequence) {
-                                customLongPressEligible = result == "true"
-                            }
-                        }
-                    }
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    if (event.pointerCount != 1 ||
-                        kotlin.math.abs(event.x - downX) > touchSlop ||
-                        kotlin.math.abs(event.y - downY) > touchSlop
-                    ) {
-                        customLongPressEligible = false
-                        ++gestureSequence
-                    }
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL,
-                MotionEvent.ACTION_POINTER_DOWN -> {
-                    if (customLongPressInProgress) {
-                        val api = if (event.actionMasked == MotionEvent.ACTION_UP)
-                            "androidPressReleased" else "androidPressCanceled"
-                        // Execute after the page receives the release. This is a
-                        // fallback when Chromium consumes the page's touchend.
-                        view.post {
-                            view.evaluateJavascript(
-                                "window.__kiTavernChatSelect && " +
-                                    "window.__kiTavernChatSelect.$api();", null
-                            )
-                        }
-                        customLongPressInProgress = false
-                    }
-                    customLongPressEligible = false
-                    ++gestureSequence
-                }
-            }
-            false // Never intercept normal WebView touch/scroll handling.
-        }
-        view.setOnLongClickListener {
-            if (!customLongPressEligible || !UrlValidator.isValid(view.url)) {
-                false // Keep Android's long-press actions on other elements.
-            } else {
-                if (diagnosticsEnabled) Log.d(TAG, "Custom text selection long-press activated")
-                customLongPressInProgress = true
-                val script = "window.__kiTavernChatSelect && " +
-                    "window.__kiTavernChatSelect.longPressAt(" +
-                    "${downX.toInt()},${downY.toInt()},${view.width},${view.height});"
-                view.evaluateJavascript(script, null)
-                true // Our handles own text selection; do not start Chromium's.
-            }
+            false // Let WebView/Chromium own native selection, editing and scrolling.
         }
 
         view.webViewClient = object : WebViewClient() {
@@ -901,7 +823,6 @@ class MainActivity : AppCompatActivity() {
                 scrollbarBridge.bounds = null
                 super.onPageStarted(view, url, favicon)
                 invalidateKeyboardLift()
-                selectionToolbar.dismissOnBack()
                 // Only ping when the local fallback has fully loaded and is idle.
                 mainFrameLoading = true
                 recoveryNavigationPending = false
@@ -916,7 +837,7 @@ class MainActivity : AppCompatActivity() {
                     installKeyboardLift(view)
                     updateChatFocusPolicy(view)
                     installScrollbarDrag(view)
-                    installChatTextSelection(view)
+                    installNativeSelectionBoundaries(view)
                     installDebugHeartbeat(view)
                 }
                 mainFrameLoading = false
@@ -1382,11 +1303,6 @@ class MainActivity : AppCompatActivity() {
                     active = null;
                     window.__kiTavernScrollbarDragging = false;
                     restoreScrollStyle();
-                    // Restore the floating text toolbar only once the thumb
-                    // has been released and the page has settled.
-                    if (window.__kiTavernChatSelect &&
-                        window.__kiTavernChatSelect.scrollbarTouchFinished)
-                        window.__kiTavernChatSelect.scrollbarTouchFinished();
                 }
 
                 function findScrollbar(x, y) {
@@ -1459,11 +1375,6 @@ class MainActivity : AppCompatActivity() {
                     found.el.style.setProperty('scroll-snap-type', 'none', 'important');
                     setPressed(found.el, true);
                     window.__kiTavernScrollbarDragging = true;
-                    // Native thumb capture doesn't produce a webpage touchstart.
-                    // Hide selection's floating toolbar right at the grab.
-                    if (window.__kiTavernChatSelect &&
-                        window.__kiTavernChatSelect.scrollbarTouchStarted)
-                        window.__kiTavernChatSelect.scrollbarTouchStarted();
                     if (kind === 'touch') document.addEventListener('touchmove',
                         onThumbTouchMove, {capture: true, passive: false});
                     // Run immediately, including when the finger has not moved:
@@ -1547,8 +1458,7 @@ class MainActivity : AppCompatActivity() {
                 document.addEventListener('touchstart', function(e) {
                     // A second finger interrupts a single-finger scrollbar drag.
                     if (active && e.touches.length !== 1) endDrag(true);
-                    if (e.touches.length !== 1 ||
-                        (e.target.closest && e.target.closest('.ki-chat-select-control'))) return;
+                    if (e.touches.length !== 1) return;
                     var t = e.changedTouches[0];
                     // A fresh press on the moving thumb takes ownership of
                     // the scroll immediately, even while the chat is flinging.
@@ -1598,8 +1508,7 @@ class MainActivity : AppCompatActivity() {
 
                 // Keep the same behaviour for a mouse or stylus dragging a thumb.
                 document.addEventListener('pointerdown', function(e) {
-                    if (e.pointerType === 'touch' || e.button !== 0 ||
-                        (e.target.closest && e.target.closest('.ki-chat-select-control'))) return;
+                    if (e.pointerType === 'touch' || e.button !== 0) return;
                     if (begin(e.clientX, e.clientY, e.pointerId, 'pointer')) {
                         try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
                         e.preventDefault();
@@ -1633,22 +1542,16 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** Chat-first selection handles with bounded, smooth edge auto-scroll. */
-    private fun installChatTextSelection(target: WebView) {
+    /** CSS-only boundaries; Android WebView owns all selection handles and gestures. */
+    private fun installNativeSelectionBoundaries(target: WebView) {
         if (!UrlValidator.isValid(target.url)) return
         try {
-            val script = assets.open("chat_selection_handles.js").bufferedReader().use { it.readText() }
+            val script = assets.open("native_selection_boundaries.js").bufferedReader().use { it.readText() }
             target.evaluateJavascript(script) { result ->
-                // Surface missing assets/JavaScript errors in Logcat instead of
-                // silently proceeding as though selection injection succeeded.
-                if (result == "\"selection-v3\"" || result == "\"already installed\"") {
-                    Log.d(TAG, "Chat text selection controller ready ($result)")
-                } else {
-                    Log.w(TAG, "Chat text selection injection returned: $result")
-                }
+                if (diagnosticsEnabled) Log.d(TAG, "Native selection boundary CSS: $result")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Could not install chat text selection", e)
+            Log.e(TAG, "Could not install native selection boundaries", e)
         }
     }
 
@@ -1901,7 +1804,6 @@ class MainActivity : AppCompatActivity() {
             if (observer.isAlive) observer.removeOnGlobalLayoutListener(keyboardLayoutListener)
         }
         invalidateKeyboardLift()
-        selectionToolbar.detach()
         if (::noPagePinger.isInitialized) noPagePinger.close()
         filePathCallback?.onReceiveValue(null)
         filePathCallback = null
