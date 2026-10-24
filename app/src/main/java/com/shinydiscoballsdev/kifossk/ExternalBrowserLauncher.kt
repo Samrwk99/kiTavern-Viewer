@@ -7,6 +7,10 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.widget.Toast
+import android.widget.ArrayAdapter
+import android.widget.CheckedTextView
+import android.view.View
+import android.view.ViewGroup
 import androidx.appcompat.app.AlertDialog
 
 /**
@@ -141,6 +145,36 @@ internal object ExternalBrowserLauncher {
             apps.filter { it.packageName != defaultPackage }.map { LinkChoice(it.packageName, it.label) }
     }
 
+    /**
+     * Native single-choice rows with each installed app's real launcher icon.
+     * The default-browser row shows the icon of Android's current default.
+     * This changes presentation only; it does not change candidate discovery,
+     * intent routing, saved choices, or Just once / Always behavior.
+     */
+    private fun iconChoicesAdapter(context: Context, choices: List<LinkChoice>): ArrayAdapter<String> {
+        val labels = choices.map { it.label }
+        val iconPx = (24f * context.resources.displayMetrics.density + 0.5f).toInt()
+        val iconGapPx = (12f * context.resources.displayMetrics.density + 0.5f).toInt()
+        val pm = context.packageManager
+        val defaultPackage = systemDefaultPackage(context)
+        return object : ArrayAdapter<String>(context, android.R.layout.select_dialog_singlechoice, labels) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val row = super.getView(position, convertView, parent)
+                val text = row as? CheckedTextView ?: return row
+                val chosenPackage = choices[position].packageName
+                val iconPackage = if (chosenPackage == SYSTEM_DEFAULT) defaultPackage else chosenPackage
+                val drawable = try {
+                    if (iconPackage.isNullOrBlank()) null else pm.getApplicationIcon(iconPackage)
+                } catch (_: Exception) { null }
+                    ?: context.getDrawable(android.R.drawable.sym_def_app_icon)
+                drawable?.setBounds(0, 0, iconPx, iconPx)
+                text.setCompoundDrawablesRelative(drawable, null, null, null)
+                text.compoundDrawablePadding = iconGapPx
+                return row
+            }
+        }
+    }
+
     fun selectedBrowserDescription(context: Context): String {
         val pkg = KioskPrefs.getExternalBrowserPackage(context) ?: return "Ask every time"
         if (pkg == SYSTEM_DEFAULT) return browserChoices(context).first().label
@@ -180,7 +214,7 @@ internal object ExternalBrowserLauncher {
         var selected = 0 // Default browser is the initial selection.
         AlertDialog.Builder(activity)
             .setTitle("Open link with")
-            .setSingleChoiceItems(choices.map { it.label }.toTypedArray(), selected) { _, which ->
+            .setSingleChoiceItems(iconChoicesAdapter(activity, choices), selected) { _, which ->
                 selected = which
             }
             .setNegativeButton("Just once") { _, _ ->
@@ -215,7 +249,7 @@ internal object ExternalBrowserLauncher {
         var selected = allChoices.indexOfFirst { it.packageName == current }.coerceAtLeast(0)
         AlertDialog.Builder(activity)
             .setTitle("External links app")
-            .setSingleChoiceItems(allChoices.map { it.label }.toTypedArray(), selected) { _, which ->
+            .setSingleChoiceItems(iconChoicesAdapter(activity, allChoices), selected) { _, which ->
                 selected = which
             }
             .setPositiveButton("Use selected app") { _, _ ->
