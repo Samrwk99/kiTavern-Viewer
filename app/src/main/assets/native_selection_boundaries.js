@@ -1,43 +1,87 @@
-/* Lightweight selection boundaries for SillyTavern in Android WebView.
- * Does not draw handles, intercept touch events, change Selection/Range,
- * manage the Android toolbar, or control scrolling. Chromium owns all of that.
+/* kiTavern: EXPERIMENTAL Chromium native selection-handle scroll bridge.
+ * Wrapper-only runtime injection. SillyTavern assets are never modified.
+ * Native Android selection handles remain owned by Chromium.
+ * No setBaseAndExtent, Range edits, or synthetic DOM touch events.
  */
 (function () {
     'use strict';
-    if (!document.getElementById('chat') || !document.getElementById('send_textarea')) {
-        return 'not a SillyTavern chat';
+    var chat = document.getElementById('chat');
+    if (!chat || !window.STSelectionBridge) return 'not SillyTavern chat';
+    if (window.__kiTavernHandleBridgeInstalled) {
+        window.__kiTavernSelectionReport && window.__kiTavernSelectionReport();
+        return 'already installed';
     }
-    var id = '__kiTavernNativeSelectionBoundaries';
-    if (document.getElementById(id)) return 'already installed';
-    var style = document.createElement('style');
-    style.id = id;
+    window.__kiTavernHandleBridgeInstalled = true;
+    var style = document.getElementById('__kiTavernNativeSelectionBoundaries');
+    if (!style) {
+        style = document.createElement('style');
+        style.id = '__kiTavernNativeSelectionBoundaries';
+        (document.head || document.documentElement).appendChild(style);
+    }
     style.textContent = [
-        // Keep document selection inside the chat, not the settings/header/composer.
-        // Controls elsewhere retain their own separate, native editing selection.
-        'html, html body, html body * {',
-        '  -webkit-user-select: none !important;',
-        '  user-select: none !important;',
-        '}',
-        'html body #chat, html body #chat * {',
-        '  -webkit-user-select: text !important;',
-        '  user-select: text !important;',
-        '}',
-        // Retain selection inside any present or future HTML editing control,
-        // including dynamically created message editors and maximized textareas.
-        'html body textarea, html body input:not([type]),',
-        'html body input[type="text"], html body input[type="search"],',
-        'html body input[type="email"], html body input[type="url"],',
-        'html body input[type="tel"], html body input[type="number"],',
-        'html body input[type="password"],',
-        'html body [contenteditable="true"], html body [contenteditable=""],',
-        'html body [role="textbox"] {',
-        '  -webkit-user-select: text !important;',
-        '  user-select: text !important;',
-        '}',
-        // When selecting at the edge, only #chat should overscroll.
-        // Selection scrolling is still Chromium's native WebView behavior.
-        '#chat { overscroll-behavior-y: contain; }'
+        // Make gap/hit-test targets inside messages selectable too. Do not
+        // impose user-select on settings, extensions, or the composer.
+        '#chat, #chat .mes, #chat .mes_block, #chat .mes_text,',
+        '#chat .mes_text *, #chat .mes_reasoning {',
+        ' -webkit-user-select:text!important; user-select:text!important; }',
+        // Keep message controls out of the text-selection path.
+        '#chat .mes_buttons, #chat .mes_buttons *,',
+        '#chat .mesAvatarWrapper, #chat .mesAvatarWrapper *,',
+        '#chat .mes_edit_buttons, #chat .mes_edit_buttons * {',
+        ' -webkit-user-select:none!important; user-select:none!important; }',
+        // Temporary hit-test shielding only while dragging a chat handle.
+        'body.st-handle-dragging #form_sheld,',
+        'body.st-handle-dragging #top-bar,',
+        'body.st-handle-dragging #top-settings-holder,',
+        'body.st-handle-dragging #chat .mes_buttons,',
+        'body.st-handle-dragging #chat .mesAvatarWrapper,',
+        'body.st-handle-dragging #chat .ch_name {',
+        ' pointer-events:none!important; }'
     ].join('\n');
-    (document.head || document.documentElement).appendChild(style);
-    return 'native-selection-boundaries-v1';
+
+    var subpixelRemainder = 0;
+    var lastReportTime = 0;
+    function inChat(node) {
+        return !!(node && (node === chat || chat.contains(node)));
+    }
+    function report(force) {
+        if (!document.getElementById('chat') || !window.STSelectionBridge) return;
+        var now = performance.now();
+        if (!force && now - lastReportTime < 24) return;
+        lastReportTime = now;
+        var s = window.getSelection();
+        var inChatSelection = !!(s && s.rangeCount === 1 && !s.isCollapsed &&
+            inChat(s.anchorNode) && inChat(s.focusNode));
+        var r = chat.getBoundingClientRect();
+        // Convert CSS viewport positions into Android WebView coordinates on
+        // the native side using innerWidth/innerHeight (not fixed dp scales).
+        window.STSelectionBridge.onSelectionStateChanged(
+            inChatSelection, r.left, r.top, r.right, r.bottom,
+            Math.max(1, window.innerWidth), Math.max(1, window.innerHeight),
+            chat.scrollTop > 0.5,
+            chat.scrollTop + chat.clientHeight < chat.scrollHeight - 0.5
+        );
+    }
+    window.__kiTavernSelectionReport = function () { report(true); };
+    window.__stSetHandleDragging = function (isDragging) {
+        subpixelRemainder = 0;
+        document.body && document.body.classList.toggle('st-handle-dragging', !!isDragging);
+        report(true);
+    };
+    window.__stAutoScrollStep = function (deltaCssPixels) {
+        if (!Number.isFinite(deltaCssPixels) || Math.abs(deltaCssPixels) > 100) return;
+        subpixelRemainder += deltaCssPixels;
+        var step = Math.trunc(subpixelRemainder);
+        if (step) {
+            subpixelRemainder -= step;
+            chat.scrollTop += step;
+        }
+        report(true);
+    };
+    document.addEventListener('selectionchange', function () { report(true); }, {passive:true});
+    chat.addEventListener('scroll', function () { report(false); }, {passive:true});
+    window.addEventListener('resize', function () { report(true); }, {passive:true});
+    window.addEventListener('pageshow', function () { report(true); }, {passive:true});
+    report(true);
+    return 'native-popup-handle-bridge-v1';
 })();

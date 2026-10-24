@@ -112,9 +112,11 @@ class MainActivity : AppCompatActivity() {
     // continue using the same output stream across Activity recreation.
     private data class RetainedBrowser(
         val view: WebView,
-        val downloads: BlobDownloaderInterface
+        val downloads: BlobDownloaderInterface,
+        val selectionAutoScroller: SillyTavernSelectionAutoScroller
     )
     private var retainedDownloadBridge: BlobDownloaderInterface? = null
+    private var selectionAutoScroller: SillyTavernSelectionAutoScroller? = null
     private val blobDownloader: BlobDownloaderInterface
         get() = retainedDownloadBridge ?: BlobDownloaderInterface(applicationContext).also {
             retainedDownloadBridge = it
@@ -599,6 +601,10 @@ class MainActivity : AppCompatActivity() {
         retainedDownloadBridge = retained?.downloads
         val retainedWebView = retained?.view
         webView = createConfiguredWebView(retainedWebView)
+        // Use the same JS bridge and touch-handle listeners after a retained WebView
+        // moves to a recreated Activity. Do not install duplicate listeners.
+        selectionAutoScroller = retained?.selectionAutoScroller
+            ?: SillyTavernSelectionAutoScroller(webView)
         container.addView(
             webView,
             FrameLayout.LayoutParams(
@@ -820,6 +826,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                selectionAutoScroller?.onNavigationStarted()
                 scrollbarBridge.bounds = null
                 super.onPageStarted(view, url, favicon)
                 invalidateKeyboardLift()
@@ -1546,6 +1553,7 @@ class MainActivity : AppCompatActivity() {
     private fun installNativeSelectionBoundaries(target: WebView) {
         if (!UrlValidator.isValid(target.url)) return
         try {
+            selectionAutoScroller?.onPageReady()
             val script = assets.open("native_selection_boundaries.js").bufferedReader().use { it.readText() }
             target.evaluateJavascript(script) { result ->
                 if (diagnosticsEnabled) Log.d(TAG, "Native selection boundary CSS: $result")
@@ -1745,6 +1753,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        selectionAutoScroller?.cancelDrag()
         activityResumed = false
         updateNoPagePinger()
         // Do not call WebView.pauseTimers(): it globally pauses JS timers for all WebViews.
@@ -1781,7 +1790,8 @@ class MainActivity : AppCompatActivity() {
             (webView.parent as? ViewGroup)?.removeView(webView)
             (webView.context as? MutableContextWrapper)?.baseContext = applicationContext
             handingWebViewToRecreatedActivity = true
-            return RetainedBrowser(webView, blobDownloader)
+            return RetainedBrowser(webView, blobDownloader,
+                requireNotNull(selectionAutoScroller))
         }
         return super.onRetainCustomNonConfigurationInstance()
     }
@@ -1811,6 +1821,7 @@ class MainActivity : AppCompatActivity() {
         pendingWebPermission = null
 
         if (::webView.isInitialized && !handingWebViewToRecreatedActivity) {
+            selectionAutoScroller?.close()
             try {
                 webView.stopLoading()
                 (webView.parent as? ViewGroup)?.removeView(webView)
