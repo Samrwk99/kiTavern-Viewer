@@ -117,6 +117,7 @@ class MainActivity : AppCompatActivity() {
     )
     private var retainedDownloadBridge: BlobDownloaderInterface? = null
     private var selectionAutoScroller: SillyTavernSelectionAutoScroller? = null
+    private var findOnPageBar: FindOnPageBar? = null
     private val blobDownloader: BlobDownloaderInterface
         get() = retainedDownloadBridge ?: BlobDownloaderInterface(applicationContext).also {
             retainedDownloadBridge = it
@@ -173,6 +174,7 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                if (findOnPageBar?.dismiss() == true) return
                 if (settingsFragment != null) closeSettings() else showSettings()
             }
         })
@@ -674,8 +676,16 @@ class MainActivity : AppCompatActivity() {
     private fun createConfiguredWebView(existing: WebView? = null): WebView {
         // A mutable context prevents our explicitly retained WebView from pinning an
         // obsolete Activity after configuration/theme recreation.
-        val view = existing ?: WebView(MutableContextWrapper(this))
+        val view = existing ?: FindOnPageWebView(MutableContextWrapper(this))
         (view.context as? MutableContextWrapper)?.baseContext = this
+        // Rebind after Activity recreation: the retained WebView must not keep
+        // a callback referencing the previous Activity instance.
+        (view as? FindOnPageWebView)?.onFindOnPageRequested = { selectedText ->
+            if (!isFinishing && !isDestroyed) {
+                val findBar = findOnPageBar ?: FindOnPageBar(this).also { findOnPageBar = it }
+                findBar.show(view, selectedText)
+            }
+        }
         view.setBackgroundColor(Color.parseColor("#1a1a2e"))
         // Disable Android's overscroll edge glow; the thumb highlight is CSS-only.
         view.overScrollMode = android.view.View.OVER_SCROLL_NEVER
@@ -826,6 +836,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                findOnPageBar?.dismiss()
                 selectionAutoScroller?.onNavigationStarted()
                 scrollbarBridge.bounds = null
                 super.onPageStarted(view, url, favicon)
@@ -1013,6 +1024,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun recoverWebViewAfterRendererExit(deadWebView: WebView) {
+        findOnPageBar?.dismiss()
         noPageAssetPageFinished = false
         mainFrameLoading = false
         recoveryNavigationPending = false
@@ -1806,6 +1818,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        findOnPageBar?.dismiss()
+        findOnPageBar = null
+        if (::webView.isInitialized) {
+            (webView as? FindOnPageWebView)?.onFindOnPageRequested = null
+        }
         activityResumed = false
         if (::container.isInitialized) {
             container.removeCallbacks(keyboardLiftUpdate)
