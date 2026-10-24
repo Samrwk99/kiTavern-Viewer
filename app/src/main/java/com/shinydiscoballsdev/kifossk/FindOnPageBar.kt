@@ -21,6 +21,10 @@ import androidx.core.view.WindowInsetsCompat
 
 /** Lightweight browser-style find bar backed by WebView's own find/highlight APIs. */
 internal class FindOnPageBar(private val activity: MainActivity) {
+    private companion object {
+        val SELECTED_TEXT_WHITESPACE = Regex("\\s+")
+    }
+
     private val handler = Handler(Looper.getMainLooper())
     private var currentWebView: WebView? = null
     private var bar: LinearLayout? = null
@@ -124,7 +128,7 @@ internal class FindOnPageBar(private val activity: MainActivity) {
             }
         }
 
-        input.setText(selectedText.replace(Regex("\\s+"), " ").trim().take(256))
+        input.setText(selectedText.replace(SELECTED_TEXT_WHITESPACE, " ").trim().take(256))
         input.setSelection(0, input.length())
         find(input.text.toString())
         input.addTextChangedListener(object : TextWatcher {

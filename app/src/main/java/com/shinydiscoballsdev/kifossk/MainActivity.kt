@@ -719,7 +719,9 @@ class MainActivity : AppCompatActivity() {
 
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
-        view.addJavascriptInterface(blobDownloader, "BlobDownloader")
+        if (existing == null) {
+            view.addJavascriptInterface(blobDownloader, "BlobDownloader")
+        }
         // Reuse the bridge with retained WebViews (rotation does not re-inject
         // JavaScript interfaces into an already-loaded page).
         val scrollbarBridge = (view.tag as? ScrollbarTouchBridge)
@@ -1109,6 +1111,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun recoverWebViewAfterRendererExit(deadWebView: WebView) {
         findOnPageBar?.dismiss()
+        selectionAutoScroller?.close()
+        selectionAutoScroller = null
         noPageAssetPageFinished = false
         mainFrameLoading = false
         recoveryNavigationPending = false
@@ -1128,6 +1132,7 @@ class MainActivity : AppCompatActivity() {
 
         if (!::container.isInitialized || isFinishing || isDestroyed) return
         webView = createConfiguredWebView()
+        selectionAutoScroller = SillyTavernSelectionAutoScroller(webView)
         container.addView(
             webView,
             FrameLayout.LayoutParams(
@@ -1161,14 +1166,25 @@ class MainActivity : AppCompatActivity() {
         val commaIndex = dataUrl.indexOf(',')
         if (commaIndex <= 0) return
         try {
+            // Keep filename/MIME resolution on the UI thread; move payload decoding
+            // and MediaStore writes off it without capturing this Activity.
             val header = dataUrl.substring(0, commaIndex).removePrefix("data:")
-            val payload = dataUrl.substring(commaIndex + 1)
             val mimeType = header.substringBefore(';').ifBlank { "text/plain" }
-            val name = "download" + mimeToExtension(mimeType)
-            if (header.split(';').any { it.equals("base64", ignoreCase = true) }) {
-                blobDownloader.downloadBase64(payload, mimeType, name)
-            } else {
-                blobDownloader.downloadText(Uri.decode(payload), mimeType, name)
+            val filename = "download" + mimeToExtension(mimeType)
+            val isBase64 = header.split(';').any { it.equals("base64", ignoreCase = true) }
+            val downloader = blobDownloader
+            downloader.enqueueDataUrlTask {
+                try {
+                    val payload = dataUrl.substring(commaIndex + 1)
+                    if (isBase64) {
+                        downloader.downloadBase64(payload, mimeType, filename)
+                    } else {
+                        downloader.downloadText(Uri.decode(payload), mimeType, filename)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Could not process data URL download", e)
+                    downloader.showDataUrlFailure()
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Could not process data URL download", e)
@@ -1203,27 +1219,29 @@ class MainActivity : AppCompatActivity() {
                     if (!token) return;
                     var offset = 0;
                     var chunkSize = 192 * 1024;
+                    var currentSliceSize = 0;
+                    var reader = new FileReader();
                     function abort() { BlobDownloader.cancelDownload(token); }
+                    reader.onload = function() {
+                        var result = reader.result || '';
+                        var separator = result.indexOf(',');
+                        if (separator < 0 || !BlobDownloader.appendChunk(token,
+                                result.substring(separator + 1))) {
+                            abort();
+                            return;
+                        }
+                        offset += currentSliceSize;
+                        setTimeout(next, 0);
+                    };
+                    reader.onerror = abort;
+                    reader.onabort = abort;
                     function next() {
                         if (offset >= blob.size) {
                             BlobDownloader.finishDownload(token);
                             return;
                         }
                         var slice = blob.slice(offset, offset + chunkSize);
-                        var reader = new FileReader();
-                        reader.onload = function() {
-                            var result = reader.result || '';
-                            var separator = result.indexOf(',');
-                            if (separator < 0 || !BlobDownloader.appendChunk(token,
-                                    result.substring(separator + 1))) {
-                                abort();
-                                return;
-                            }
-                            offset += slice.size;
-                            setTimeout(next, 0);
-                        };
-                        reader.onerror = abort;
-                        reader.onabort = abort;
+                        currentSliceSize = slice.size;
                         reader.readAsDataURL(slice);
                     }
                     next();
@@ -1271,6 +1289,7 @@ class MainActivity : AppCompatActivity() {
                 var moveFrame = 0;
                 var pendingMoveY = null;
                 var nativeGeometryFrame = 0;
+                var lastReportedNativeGeometry = undefined;
                 // Keep the native hit region aligned with the real scrollbar
                 // thumb. No extra visible scrollbar or overlay is created.
                 function currentPrimaryTrack() {
@@ -1298,13 +1317,24 @@ class MainActivity : AppCompatActivity() {
                     var bridge = window.KiTavernScrollbarTouch;
                     if (!bridge) return;
                     var track = currentPrimaryTrack();
-                    if (!track) { bridge.clear(); return; }
+                    if (!track) {
+                        if (lastReportedNativeGeometry !== null) {
+                            lastReportedNativeGeometry = null;
+                            bridge.clear();
+                        }
+                        return;
+                    }
                     var thumb = thumbGeometry(track);
                     var tolerance = thumbVerticalTolerance(track, thumb);
-                    bridge.report(track.isRoot ? 'root' : 'chat', track.right,
-                        thumb.top - tolerance,
-                        thumb.top + thumb.height + tolerance,
-                        innerWidth, innerHeight);
+                    var geometry = [track.isRoot ? 'root' : 'chat', track.right,
+                        thumb.top - tolerance, thumb.top + thumb.height + tolerance,
+                        innerWidth, innerHeight];
+                    var prior = lastReportedNativeGeometry;
+                    if (prior && geometry.every(function(value, i) { return value === prior[i]; }))
+                        return;
+                    lastReportedNativeGeometry = geometry;
+                    bridge.report(geometry[0], geometry[1], geometry[2], geometry[3],
+                        geometry[4], geometry[5]);
                 }
                 function scheduleNativeGeometry() {
                     if (!nativeGeometryFrame)
@@ -1645,13 +1675,16 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private val nativeSelectionBoundariesScript: String by lazy {
+        assets.open("native_selection_boundaries.js").bufferedReader().use { it.readText() }
+    }
+
     /** CSS-only boundaries; Android WebView owns all selection handles and gestures. */
     private fun installNativeSelectionBoundaries(target: WebView) {
         if (!UrlValidator.isValid(target.url)) return
         try {
             selectionAutoScroller?.onPageReady()
-            val script = assets.open("native_selection_boundaries.js").bufferedReader().use { it.readText() }
-            target.evaluateJavascript(script) { result ->
+            target.evaluateJavascript(nativeSelectionBoundariesScript) { result ->
                 if (diagnosticsEnabled) Log.d(TAG, "Native selection boundary CSS: $result")
             }
         } catch (e: Exception) {
@@ -1904,7 +1937,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         findOnPageBar?.dismiss()
         findOnPageBar = null
-        if (::webView.isInitialized) {
+        if (::webView.isInitialized && !handingWebViewToRecreatedActivity) {
             (webView as? FindOnPageWebView)?.onFindOnPageRequested = null
         }
         activityResumed = false

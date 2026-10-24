@@ -42,6 +42,23 @@ class BlobDownloaderInterface(context: Context) {
         private const val MAX_TRANSFERS = 3
         private const val MAX_ENCODED_CHUNK_LENGTH = 512 * 1024
         private const val STALE_TRANSFER_MS = 15 * 60 * 1000L
+
+        // One process-scoped worker: survives Activity rotation but releases its
+        // thread after 30 seconds idle. It captures no Activity or WebView.
+        private val dataUrlExecutor by lazy {
+            java.util.concurrent.ThreadPoolExecutor(
+                0, 1, 30L, java.util.concurrent.TimeUnit.SECONDS,
+                java.util.concurrent.LinkedBlockingQueue<Runnable>()
+            ) { command -> Thread(command, "kiTavern-data-download") }
+        }
+    }
+
+    fun enqueueDataUrlTask(task: () -> Unit) {
+        dataUrlExecutor.execute(task)
+    }
+
+    fun showDataUrlFailure() {
+        showToast("Download failed")
     }
 
     /** Begin a download. Return an opaque token, or an empty string on failure. */

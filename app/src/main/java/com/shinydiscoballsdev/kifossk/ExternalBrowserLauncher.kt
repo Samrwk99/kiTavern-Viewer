@@ -59,12 +59,16 @@ internal object ExternalBrowserLauncher {
     ) {
         val pkg = info.activityInfo?.packageName ?: return
         if (pkg == context.packageName || pkg == "android" || pkg.isBlank()) return
+        val previous = found[pkg]
+        if (previous != null) {
+            if (browser && !previous.isBrowser) {
+                found[pkg] = previous.copy(isBrowser = true)
+            }
+            return
+        }
         val label = try { info.loadLabel(context.packageManager).toString().ifBlank { pkg } }
         catch (_: Exception) { pkg }
-        val previous = found[pkg]
-        if (previous == null || (browser && !previous.isBrowser)) {
-            found[pkg] = AppChoice(pkg, label, browser || previous?.isBrowser == true)
-        }
+        found[pkg] = AppChoice(pkg, label, browser)
     }
 
     private fun systemDefaultPackage(context: Context): String? {
@@ -136,8 +140,10 @@ internal object ExternalBrowserLauncher {
         }.sortedWith(compareBy<AppChoice>({ !it.isBrowser }, { it.label.lowercase() }))
     }
 
-    private fun browserChoices(context: Context): List<LinkChoice> {
-        val apps = availableApps(context).filter { it.isBrowser }
+    private fun browserChoices(
+        context: Context, allApps: List<AppChoice> = availableApps(context)
+    ): List<LinkChoice> {
+        val apps = allApps.filter { it.isBrowser }
         val defaultPackage = systemDefaultPackage(context)
         val defaultName = apps.firstOrNull { it.packageName == defaultPackage }?.label
         val defaultLabel = if (defaultName != null) "Default browser ($defaultName)" else "Default browser (Android)"
@@ -157,16 +163,27 @@ internal object ExternalBrowserLauncher {
         val iconGapPx = (12f * context.resources.displayMetrics.density + 0.5f).toInt()
         val pm = context.packageManager
         val defaultPackage = systemDefaultPackage(context)
+        // Cache package icon lookups only for the lifetime of this dialog.
+        val iconCache = HashMap<String, android.graphics.drawable.Drawable?>()
+        val fallbackIcon = context.getDrawable(android.R.drawable.sym_def_app_icon)
         return object : ArrayAdapter<String>(context, android.R.layout.select_dialog_singlechoice, labels) {
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val row = super.getView(position, convertView, parent)
                 val text = row as? CheckedTextView ?: return row
                 val chosenPackage = choices[position].packageName
                 val iconPackage = if (chosenPackage == SYSTEM_DEFAULT) defaultPackage else chosenPackage
-                val drawable = try {
-                    if (iconPackage.isNullOrBlank()) null else pm.getApplicationIcon(iconPackage)
-                } catch (_: Exception) { null }
-                    ?: context.getDrawable(android.R.drawable.sym_def_app_icon)
+                val drawable = if (iconPackage.isNullOrBlank()) {
+                    fallbackIcon
+                } else {
+                    if (iconCache.containsKey(iconPackage)) {
+                        iconCache[iconPackage]
+                    } else {
+                        val icon = try { pm.getApplicationIcon(iconPackage) }
+                            catch (_: Exception) { fallbackIcon }
+                        iconCache[iconPackage] = icon
+                        icon
+                    }
+                }
                 drawable?.setBounds(0, 0, iconPx, iconPx)
                 text.setCompoundDrawablesRelative(drawable, null, null, null)
                 text.compoundDrawablePadding = iconGapPx
@@ -236,7 +253,7 @@ internal object ExternalBrowserLauncher {
 
     fun chooseInSettings(activity: Activity, onChanged: () -> Unit) {
         val choices = availableApps(activity)
-        val defaultLabel = browserChoices(activity).first().label
+        val defaultLabel = browserChoices(activity, choices).first().label
         // All user-launchable apps are exposed in Settings. Apps that aren't
         // web handlers may be selected; on opening a link we fail safely back
         // to the picker rather than losing the link or navigating in WebView.
