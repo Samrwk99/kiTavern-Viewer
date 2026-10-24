@@ -40,6 +40,11 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         private const val MAX_OVERSHOOT_DP = 96f
         private const val MIN_SPEED_DP_S = 45f
         private const val MAX_SPEED_DP_S = 750f
+        // Only sustained native-handle edge auto-scrolling accelerates.
+        // Every 1.5 seconds in one direction adds 40%, up to 4x the usual speed.
+        private const val ACCELERATION_INTERVAL_MS = 1_500L
+        private const val ACCELERATION_STEP = 0.40f
+        private const val MAX_ACCELERATION_FACTOR = 4.0f
         private const val TOP_SAFE_DP = 36f
         private const val BOTTOM_SAFE_DP = 18f
         private const val SIDE_SAFE_DP = 14f
@@ -70,6 +75,11 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     private var fedY = 0f
     private var running = false
     private var lastFrameNanos = 0L
+    // This clock runs only while the handle is actively edge-scrolling #chat.
+    // A change of direction, moving out of the edge zone, or lifting the
+    // finger resets it, so ordinary handle movement is never accelerated.
+    private var edgeScrollDirection = 0
+    private var edgeScrollStartedMs = 0L
     private var jitter = false
     private var lastScanMs = 0L
     private val lastScanEnqueuedMs = AtomicLong(0L)
@@ -137,6 +147,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 handleRef = WeakReference(handle)
                 dragging = true
                 jitter = false
+                resetAcceleration()
                 webView.evaluateJavascript(
                     "window.__stSetHandleDragging && window.__stSetHandleDragging(true);", null
                 )
@@ -158,6 +169,9 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 fedX = result.x
                 fedY = result.y
                 if (abs(result.velocity) > 0.01f) {
+                    // Start or restart the timer on the actual drag movement,
+                    // including when the user switches scroll direction.
+                    acceleratedVelocity(result.velocity, SystemClock.uptimeMillis())
                     if (!running) {
                         Log.d(TAG, "Native handle edge auto-scroll started")
                         startFrames()
@@ -240,6 +254,32 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             clampedTipY + fingerOffsetY, v)
     }
 
+    private fun resetAcceleration() {
+        edgeScrollDirection = 0
+        edgeScrollStartedMs = 0L
+    }
+
+    private fun acceleratedVelocity(baseVelocity: Float, nowMs: Long): Float {
+        val direction = when {
+            baseVelocity > 0.01f -> 1
+            baseVelocity < -0.01f -> -1
+            else -> 0
+        }
+        if (direction == 0) {
+            resetAcceleration()
+            return 0f
+        }
+        if (direction != edgeScrollDirection) {
+            edgeScrollDirection = direction
+            edgeScrollStartedMs = nowMs
+        }
+        val steps = ((nowMs - edgeScrollStartedMs).coerceAtLeast(0L) /
+            ACCELERATION_INTERVAL_MS).toFloat()
+        val factor = (1f + steps * ACCELERATION_STEP)
+            .coerceAtMost(MAX_ACCELERATION_FACTOR)
+        return baseVelocity * factor
+    }
+
     private fun forwardSynthetic(handle: View, action: Int, x: Float, y: Float,
                                  whenMs: Long) {
         // Chromium's PopupTouchHandleDrawable converts RAW/local coordinates
@@ -277,8 +317,13 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 stopFrames()
                 return
             }
+            // Increase speed only during uninterrupted edge auto-scrolling
+            // in the same direction; keep the existing native handle pump.
+            val accelerated = acceleratedVelocity(
+                result.velocity, SystemClock.uptimeMillis()
+            )
             // Let the JS side scroll #chat without rewriting Range/Selection.
-            val delta = result.velocity * deltaSeconds
+            val delta = accelerated * deltaSeconds
             if (delta.isFinite()) {
                 webView.evaluateJavascript(
                     "window.__stAutoScrollStep && window.__stAutoScrollStep($delta);", null
@@ -302,6 +347,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     }
 
     private fun stopFrames() {
+        resetAcceleration()
         if (!running) return
         running = false
         lastFrameNanos = 0L
