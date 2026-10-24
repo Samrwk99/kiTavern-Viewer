@@ -29,7 +29,8 @@ import kotlin.math.sign
  * views, and only changes their coordinates for a selection entirely in #chat.
  * Incompatible WebView implementations automatically fall back to native input.
  *
- * No SillyTavern files are changed and no DOM selection ranges are rewritten.
+ * SillyTavern files are unchanged. A guarded DOM-anchor recovery runs only
+ * if Chromium corrupts the fixed endpoint when a handle is re-grabbed.
  * This depends on Chromium implementation details, not a supported WebView API.
  */
 class SillyTavernSelectionAutoScroller(private val webView: WebView) {
@@ -81,9 +82,27 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     private var edgeScrollDirection = 0
     private var edgeScrollStartedMs = 0L
     private var jitter = false
+    // evaluateJavascript scrolls asynchronously. Do not finish a drag until
+    // every scroll requested by that drag has completed and Chromium has seen
+    // the endpoint at the final scrolled position. Otherwise a second grab
+    // can re-anchor against a stale/offscreen bound and swap the handles.
+    private var gestureGeneration = 0L
+    private var pendingScrollSteps = 0
+    private var scrolledDuringGesture = false
+    private data class PendingRelease(val action: Int, val eventTime: Long)
+    private var pendingRelease: PendingRelease? = null
     private var lastScanMs = 0L
     private val lastScanEnqueuedMs = AtomicLong(0L)
     private var closed = false
+    // Capture the genuine DOM fixed endpoint before Chromium receives the
+    // first MOVE of a newly grabbed popup handle. WebView JS evaluation is
+    // asynchronous, so hold any intervening touch events until that snapshot
+    // is acknowledged. This is only at gesture start, not every frame.
+    private var waitingForAnchorSnapshot = false
+    private var bufferedDown: MotionEvent? = null
+    private var nativeDownDelivered = false
+    private var bufferedMove: MotionEvent? = null
+    private var bufferedRelease: MotionEvent? = null
 
     init {
         // Register before page navigation. This JS interface contains only a
@@ -103,11 +122,62 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
 
     fun cancelDrag() {
         stopFrames()
-        if (dragging) webView.evaluateJavascript(
+        val wasDeliveredToChromium = nativeDownDelivered
+        waitingForAnchorSnapshot = false
+        bufferedDown?.recycle()
+        bufferedDown = null
+        nativeDownDelivered = false
+        bufferedMove?.recycle()
+        bufferedMove = null
+        bufferedRelease?.recycle()
+        bufferedRelease = null
+        // Invalidate callbacks from the previous navigation/drag. If Chromium
+        // still owns a handle gesture, finish it with CANCEL before discarding
+        // our reference; otherwise the next DOWN can inherit active state.
+        gestureGeneration++
+        pendingScrollSteps = 0
+        pendingRelease = null
+        if (dragging) {
+            handleRef?.get()?.let { handle ->
+                if (wasDeliveredToChromium && handle.isAttachedToWindow) {
+                    forwardSynthetic(handle, MotionEvent.ACTION_CANCEL,
+                        fedX, fedY, SystemClock.uptimeMillis())
+                }
+            }
+            webView.evaluateJavascript(
+                "window.__stSetHandleDragging && window.__stSetHandleDragging(false);", null
+            )
+        }
+        dragging = false
+        handleRef = null
+        scrolledDuringGesture = false
+    }
+
+    // Called only after the current drag's queued JS scroll steps have finished.
+    // A last MOVE without the oscillating jitter reconciles the selected DOM
+    // endpoint with the final chat scroll position before Chromium's UP.
+    private fun finishNativeRelease(handle: View, release: PendingRelease) {
+        if (!dragging || handleRef?.get() !== handle) return
+        if (!nativeDownDelivered) return
+        if (release.action == MotionEvent.ACTION_UP && scrolledDuringGesture) {
+            val finalFeed = clampAndVelocity(rawX, rawY)
+            fedX = finalFeed.x
+            fedY = finalFeed.y
+            forwardSynthetic(handle, MotionEvent.ACTION_MOVE,
+                fedX, fedY, release.eventTime)
+        }
+        forwardSynthetic(handle, release.action, fedX, fedY, release.eventTime)
+        webView.evaluateJavascript(
             "window.__stSetHandleDragging && window.__stSetHandleDragging(false);", null
         )
         dragging = false
+        nativeDownDelivered = false
         handleRef = null
+        pendingRelease = null
+        pendingScrollSteps = 0
+        gestureGeneration++ // Ignore any late JavaScript completion callbacks.
+        scrolledDuringGesture = false
+        Log.d(TAG, "Native handle UP/CANCEL (scroll and endpoint synchronized)")
     }
 
     fun close() {
@@ -128,9 +198,32 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         if (closed || !pageReady) return@OnTouchListener false
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                // A very fast re-grab can occur while a previous JS callback
+                // is still returning. Finish that old Chromium gesture first.
+                if (dragging) {
+                    val oldHandle = handleRef?.get()
+                    val oldRelease = pendingRelease
+                    if (oldHandle != null && oldRelease != null) {
+                        finishNativeRelease(oldHandle, oldRelease)
+                    } else {
+                        cancelDrag()
+                    }
+                }
                 if (!hasChatSelection || event.pointerCount != 1) {
                     return@OnTouchListener false
                 }
+                gestureGeneration++
+                waitingForAnchorSnapshot = false
+                bufferedDown?.recycle()
+                bufferedDown = null
+                nativeDownDelivered = false
+                bufferedMove?.recycle()
+                bufferedMove = null
+                bufferedRelease?.recycle()
+                bufferedRelease = null
+                pendingScrollSteps = 0
+                pendingRelease = null
+                scrolledDuringGesture = false
                 // The popup origin is the caret's nominal handle position in
                 // current Chromium WebView. Maintain the actual finger-to-origin
                 // offset rather than assuming the finger touches the tip.
@@ -152,66 +245,194 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                     "window.__stSetHandleDragging && window.__stSetHandleDragging(true);", null
                 )
                 Log.d(TAG, "Chat native handle DOWN intercepted")
-                // Forward DOWN exactly once to Chromium. Returning true means
-                // View.dispatchTouchEvent will not call onTouchEvent again.
-                handle.onTouchEvent(event)
+                // Chromium's TouchHandle::BeginDrag can re-hit-test the
+                // *opposite* endpoint right on ACTION_DOWN. Do not forward DOWN
+                // until the JS snapshot captures its original offscreen node.
+                // MotionEvent.obtain(event) retains the genuine popup-local,
+                // raw-screen, pointer and timing metadata (no synthetic DOWN).
+                waitingForAnchorSnapshot = true
+                bufferedDown = MotionEvent.obtain(event)
+                val generation = gestureGeneration
+                val handleCssX = screenToCssX(originX)
+                val handleCssY = screenToCssY(originY)
+                try {
+                    webView.evaluateJavascript(
+                        "window.__stSelectionAnchorLock && " +
+                        "window.__stSelectionAnchorLock.begin($handleCssX,$handleCssY);"
+                    ) { response ->
+                        if (closed || generation != gestureGeneration ||
+                            !dragging || handleRef?.get() !== handle) return@evaluateJavascript
+                        waitingForAnchorSnapshot = false
+                        Log.d(TAG, "Re-grab anchor snapshot: $response")
+                        deliverBufferedDown(handle)
+                        if (!nativeDownDelivered) {
+                            cancelDrag()
+                            return@evaluateJavascript
+                        }
+                        val move = bufferedMove
+                        bufferedMove = null
+                        if (move != null) {
+                            try { processHandleMove(handle, move) }
+                            finally { move.recycle() }
+                        }
+                        val release = bufferedRelease
+                        bufferedRelease = null
+                        if (release != null) {
+                            try { processHandleRelease(handle, release) }
+                            finally { release.recycle() }
+                        }
+                    }
+                } catch (error: RuntimeException) {
+                    waitingForAnchorSnapshot = false
+                    Log.w(TAG, "Anchor snapshot unavailable; using native handling", error)
+                    deliverBufferedDown(handle)
+                }
+                // Avoid losing the DOWN forever if renderer JavaScript stalls.
+                webView.postDelayed({
+                    if (dragging && generation == gestureGeneration &&
+                        waitingForAnchorSnapshot && handleRef?.get() === handle) {
+                        Log.w(TAG, "Anchor snapshot timeout; forwarding real DOWN")
+                        waitingForAnchorSnapshot = false
+                        deliverBufferedDown(handle)
+                        if (!nativeDownDelivered) {
+                            cancelDrag()
+                            return@postDelayed
+                        }
+                        val move = bufferedMove
+                        bufferedMove = null
+                        if (move != null) {
+                            try { processHandleMove(handle, move) }
+                            finally { move.recycle() }
+                        }
+                        val release = bufferedRelease
+                        bufferedRelease = null
+                        if (release != null) {
+                            try { processHandleRelease(handle, release) }
+                            finally { release.recycle() }
+                        }
+                    }
+                }, 180L)
                 true
             }
             MotionEvent.ACTION_MOVE -> {
-                if (!dragging || handleRef?.get() !== handle) return@OnTouchListener false
-                if (event.pointerCount != 1) {
-                    cancelDrag()
+                if (!dragging || handleRef?.get() !== handle)
                     return@OnTouchListener false
+                if (waitingForAnchorSnapshot) {
+                    bufferedMove?.recycle()
+                    bufferedMove = MotionEvent.obtain(event)
+                    return@OnTouchListener true
                 }
-                rawX = event.rawX
-                rawY = event.rawY
-                val result = clampAndVelocity(rawX, rawY)
-                fedX = result.x
-                fedY = result.y
-                if (abs(result.velocity) > 0.01f) {
-                    // Start or restart the timer on the actual drag movement,
-                    // including when the user switches scroll direction.
-                    acceleratedVelocity(result.velocity, SystemClock.uptimeMillis())
-                    if (!running) {
-                        Log.d(TAG, "Native handle edge auto-scroll started")
-                        startFrames()
-                    }
-                    // Send the latest *clamped* coordinate now too, rather than
-                    // waiting for the first animation callback.
-                    forwardSynthetic(handle, MotionEvent.ACTION_MOVE, fedX, fedY,
-                        event.eventTime)
-                } else {
-                    stopFrames()
-                    forwardSynthetic(handle, MotionEvent.ACTION_MOVE, fedX, fedY,
-                        event.eventTime)
-                }
+                processHandleMove(handle, event)
                 true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (!dragging || handleRef?.get() !== handle) return@OnTouchListener false
-                stopFrames()
-                forwardSynthetic(handle, event.actionMasked, fedX, fedY, event.eventTime)
-                webView.evaluateJavascript(
-                    "window.__stSetHandleDragging && window.__stSetHandleDragging(false);", null
-                )
-                dragging = false
-                handleRef = null
-                Log.d(TAG, "Native handle UP/CANCEL")
+                if (!dragging || handleRef?.get() !== handle)
+                    return@OnTouchListener false
+                if (waitingForAnchorSnapshot) {
+                    bufferedRelease?.recycle()
+                    bufferedRelease = MotionEvent.obtain(event)
+                    return@OnTouchListener true
+                }
+                processHandleRelease(handle, event)
                 true
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
                 // Multi-finger gestures are not supported by this experimental
                 // bridge. Cancel the intercepted handle sequence safely.
                 if (dragging && handleRef?.get() === handle) {
-                    stopFrames()
-                    forwardSynthetic(handle, MotionEvent.ACTION_CANCEL, fedX, fedY,
-                        event.eventTime)
                     cancelDrag()
                     return@OnTouchListener true
                 }
                 false
             }
             else -> false
+        }
+    }
+
+    private fun deliverBufferedDown(handle: View) {
+        val realDown = bufferedDown ?: return
+        bufferedDown = null
+        try {
+            if (handle.isAttachedToWindow) {
+                nativeDownDelivered = true
+                handle.onTouchEvent(realDown)
+            }
+        } finally {
+            realDown.recycle()
+        }
+    }
+
+    private fun screenToCssX(screenX: Float): Float {
+        webView.getLocationOnScreen(screenLocation)
+        return (screenX - screenLocation[0]) * viewportWidthCss /
+            webView.width.coerceAtLeast(1)
+    }
+
+    private fun screenToCssY(screenY: Float): Float {
+        webView.getLocationOnScreen(screenLocation)
+        return (screenY - screenLocation[1]) * viewportHeightCss /
+            webView.height.coerceAtLeast(1)
+    }
+
+    // The clamped handle tip, not the physical finger, is where Chromium
+    // positions the caret. Supply a point slightly above that tip to the
+    // guarded DOM-anchor recovery helper.
+    private fun reportMovingPoint(screenX: Float, screenY: Float) {
+        val cssX = screenToCssX(screenX - fingerOffsetX)
+        val cssY = screenToCssY(screenY - fingerOffsetY - dp(12f))
+        webView.evaluateJavascript(
+            "window.__stSelectionAnchorLock && " +
+            "window.__stSelectionAnchorLock.point($cssX,$cssY);", null
+        )
+    }
+
+    private fun processHandleMove(handle: View, event: MotionEvent) {
+        if (pendingRelease != null && handleRef?.get() === handle) return
+        if (!dragging || handleRef?.get() !== handle) return
+        if (event.pointerCount != 1) {
+            cancelDrag()
+            return
+        }
+        rawX = event.rawX
+        rawY = event.rawY
+        val result = clampAndVelocity(rawX, rawY)
+        fedX = result.x
+        fedY = result.y
+        reportMovingPoint(fedX, fedY)
+        if (abs(result.velocity) > 0.01f) {
+            acceleratedVelocity(result.velocity, SystemClock.uptimeMillis())
+            if (!running) {
+                Log.d(TAG, "Native handle edge auto-scroll started")
+                startFrames()
+            }
+        } else {
+            stopFrames()
+        }
+        forwardSynthetic(handle, MotionEvent.ACTION_MOVE, fedX, fedY,
+            event.eventTime)
+    }
+
+    private fun processHandleRelease(handle: View, event: MotionEvent) {
+        if (!dragging || handleRef?.get() !== handle) return
+        if (!nativeDownDelivered) {
+            cancelDrag()
+            return
+        }
+        stopFrames()
+        val release = PendingRelease(event.actionMasked, event.eventTime)
+        if (pendingScrollSteps > 0) {
+            pendingRelease = release
+            Log.d(TAG, "Deferring handle UP until $pendingScrollSteps scroll steps finish")
+            val releaseGeneration = gestureGeneration
+            webView.postDelayed({
+                if (dragging && gestureGeneration == releaseGeneration &&
+                    pendingRelease === release) {
+                    Log.w(TAG, "Scroll acknowledgement timeout; ending handle drag")
+                    finishNativeRelease(handle, release)
+                }
+            }, 350L)
+        } else {
+            finishNativeRelease(handle, release)
         }
     }
 
@@ -325,9 +546,33 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             // Let the JS side scroll #chat without rewriting Range/Selection.
             val delta = accelerated * deltaSeconds
             if (delta.isFinite()) {
-                webView.evaluateJavascript(
-                    "window.__stAutoScrollStep && window.__stAutoScrollStep($delta);", null
-                )
+                // The JavaScript scroll and Chromium's MOVE are on different
+                // queues. Track outstanding scroll work so that the *last*
+                // MOVE and UP are never delivered against stale scroll bounds.
+                val generation = gestureGeneration
+                pendingScrollSteps++
+                scrolledDuringGesture = true
+                try {
+                    webView.evaluateJavascript(
+                        "window.__stAutoScrollStep && " +
+                        "window.__stAutoScrollStep($delta,${screenToCssX(fedX - fingerOffsetX)}," +
+                        "${screenToCssY(fedY - fingerOffsetY - dp(12f))});"
+                    ) { _ ->
+                        if (generation == gestureGeneration) {
+                            pendingScrollSteps = (pendingScrollSteps - 1).coerceAtLeast(0)
+                            if (pendingScrollSteps == 0) {
+                                val release = pendingRelease
+                                val activeHandle = handleRef?.get()
+                                if (release != null && activeHandle != null) {
+                                    finishNativeRelease(activeHandle, release)
+                                }
+                            }
+                        }
+                    }
+                } catch (error: RuntimeException) {
+                    pendingScrollSteps = (pendingScrollSteps - 1).coerceAtLeast(0)
+                    Log.w(TAG, "Unable to queue native-handle scroll", error)
+                }
             }
             // The supplied diagnosis proposes a small alternating offset to
             // make Chromium reconsider the native endpoint as chat moves.

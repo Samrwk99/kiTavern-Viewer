@@ -1,7 +1,8 @@
 /* kiTavern: EXPERIMENTAL Chromium native selection-handle scroll bridge.
  * Wrapper-only runtime injection. SillyTavern assets are never modified.
  * Native Android selection handles remain owned by Chromium.
- * No setBaseAndExtent, Range edits, or synthetic DOM touch events.
+ * Native range updates are preserved; a guarded re-grab recovery repairs
+ * the fixed DOM endpoint only if Chromium moves it incorrectly.
  */
 (function () {
     'use strict';
@@ -65,10 +66,16 @@
     window.__kiTavernSelectionReport = function () { report(true); };
     window.__stSetHandleDragging = function (isDragging) {
         subpixelRemainder = 0;
+        if (!isDragging && window.__stSelectionAnchorLock) {
+            window.__stSelectionAnchorLock.end();
+        }
         document.body && document.body.classList.toggle('st-handle-dragging', !!isDragging);
         report(true);
     };
-    window.__stAutoScrollStep = function (deltaCssPixels) {
+    window.__stAutoScrollStep = function (deltaCssPixels, pointX, pointY) {
+        if (window.__stSelectionAnchorLock && Number.isFinite(pointX) && Number.isFinite(pointY)) {
+            window.__stSelectionAnchorLock.point(pointX, pointY);
+        }
         if (!Number.isFinite(deltaCssPixels) || Math.abs(deltaCssPixels) > 100) return;
         subpixelRemainder += deltaCssPixels;
         var step = Math.trunc(subpixelRemainder);
@@ -78,7 +85,117 @@
         }
         report(true);
     };
-    document.addEventListener('selectionchange', function () { report(true); }, {passive:true});
+    // The DOM endpoint stays valid even when its native handle is far outside
+    // the clipped #chat viewport. Chromium re-hit-tests both viewport handle
+    // coordinates on each new drag, which can dislodge this fixed endpoint.
+    // Capture before first MOVE; restore only if that endpoint changes.
+    window.__stSelectionAnchorLock = (function () {
+        var lockedNode = null, lockedOffset = 0, role = null;
+        var lastPointX = NaN, lastPointY = NaN;
+        var repairs = 0, lastRepair = -Infinity, repairing = false;
+
+        function endpointRect(node, offset) {
+            try {
+                var r = document.createRange();
+                r.setStart(node, offset);
+                r.collapse(true);
+                return r.getBoundingClientRect();
+            } catch (_) { return null; }
+        }
+        function same(node, offset) {
+            return node === lockedNode && offset === lockedOffset;
+        }
+        function positionCmp(a, ao, b, bo) {
+            try {
+                var x = document.createRange(), y = document.createRange();
+                x.setStart(a, ao); x.collapse(true);
+                y.setStart(b, bo); y.collapse(true);
+                return x.compareBoundaryPoints(Range.START_TO_START, y);
+            } catch (_) { return null; }
+        }
+        function stop() {
+            lockedNode = null; lockedOffset = 0; role = null;
+            repairing = false; repairs = 0;
+            lastPointX = NaN; lastPointY = NaN;
+        }
+        function repairIfNeeded() {
+            if (!role || repairing || !lockedNode || !lockedNode.isConnected ||
+                !inChat(lockedNode)) return;
+            var sel = window.getSelection();
+            if (!sel || !sel.rangeCount) return;
+            var range = sel.getRangeAt(0);
+            var fixedNode = role === 'upper' ? range.endContainer : range.startContainer;
+            var fixedOffset = role === 'upper' ? range.endOffset : range.startOffset;
+            if (same(fixedNode, fixedOffset)) return; // No rewriting during normal dragging.
+            // If Chromium swapped the other endpoint at re-grab, recover the
+            // moving caret from the *clamped* in-chat point rather than its
+            // possibly corrupted native selection coordinates.
+            var movingNode = null, movingOffset = 0;
+            if (Number.isFinite(lastPointX) && Number.isFinite(lastPointY)) {
+                var rect = chat.getBoundingClientRect();
+                var x = Math.max(rect.left + 3, Math.min(rect.right - 3, lastPointX));
+                var y = Math.max(rect.top + 3, Math.min(rect.bottom - 3, lastPointY));
+                var caret = document.caretRangeFromPoint && document.caretRangeFromPoint(x, y);
+                if (caret && inChat(caret.startContainer)) {
+                    movingNode = caret.startContainer;
+                    movingOffset = caret.startOffset;
+                }
+            }
+            if (!movingNode) {
+                movingNode = role === 'upper' ? range.startContainer : range.endContainer;
+                movingOffset = role === 'upper' ? range.startOffset : range.endOffset;
+            }
+            if (!inChat(movingNode)) return;
+            var order = positionCmp(movingNode, movingOffset, lockedNode, lockedOffset);
+            if (order === null || (role === 'upper' && order >= 0) ||
+                (role === 'lower' && order <= 0)) return;
+            // Avoid an endless native/JS selection tug-of-war in an unsupported
+            // Chromium version: apply at most 12 targeted repairs per drag.
+            var now = performance.now();
+            if (repairs >= 12 || now - lastRepair < 48) return;
+            repairing = true;
+            try {
+                sel.setBaseAndExtent(lockedNode, lockedOffset, movingNode, movingOffset);
+                repairs++;
+                lastRepair = now;
+            } catch (_) {
+                stop();
+            } finally {
+                repairing = false;
+            }
+        }
+        return {
+            begin: function (x, y) {
+                stop();
+                var sel = window.getSelection();
+                if (!sel || sel.isCollapsed || sel.rangeCount !== 1) return 'none';
+                var r = sel.getRangeAt(0);
+                if (!inChat(r.startContainer) || !inChat(r.endContainer)) return 'outside';
+                var a = endpointRect(r.startContainer, r.startOffset);
+                var b = endpointRect(r.endContainer, r.endOffset);
+                if (!a || !b || !Number.isFinite(y)) return 'no-rect';
+                // Pick the DOM endpoint nearest the real popup handle tip.
+                var upperDistance = Math.abs(a.bottom - y);
+                var lowerDistance = Math.abs(b.bottom - y);
+                role = upperDistance <= lowerDistance ? 'upper' : 'lower';
+                lockedNode = role === 'upper' ? r.endContainer : r.startContainer;
+                lockedOffset = role === 'upper' ? r.endOffset : r.startOffset;
+                lastPointX = x; lastPointY = y - 12; // Caret is above the handle tip.
+                return role;
+            },
+            point: function (x, y) {
+                if (!role) return;
+                if (Number.isFinite(x)) lastPointX = x;
+                if (Number.isFinite(y)) lastPointY = y;
+            },
+            check: repairIfNeeded,
+            end: stop
+        };
+    })();
+    document.addEventListener('selectionchange', function () {
+        window.__stSelectionAnchorLock.check();
+        report(true);
+    }, {passive:true});
     chat.addEventListener('scroll', function () { report(false); }, {passive:true});
     window.addEventListener('resize', function () { report(true); }, {passive:true});
     window.addEventListener('pageshow', function () { report(true); }, {passive:true});
