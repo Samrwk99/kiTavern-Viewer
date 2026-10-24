@@ -927,6 +927,21 @@ class MainActivity : AppCompatActivity() {
                     return false
                 }
 
+                // WebView may convert accept=".json, .jsonl" into only application/json.
+                // Many Android document providers do not assign a JSON MIME type to .jsonl,
+                // so the picker hides valid chat exports. Only relax this particular
+                // chooser request; keep all other upload filters and chooser extras intact.
+                val acceptsJsonl = fileChooserParams?.acceptTypes?.any { accept ->
+                    accept.split(',', ';', ' ', '\t', '\r', '\n')
+                        .any { it.equals(".jsonl", ignoreCase = true) }
+                } == true
+                if (acceptsJsonl) {
+                    chooserIntent.type = "*/*"
+                    // A stale JSON-only MIME allowlist would override the wildcard on
+                    // document providers that honour EXTRA_MIME_TYPES.
+                    chooserIntent.removeExtra(Intent.EXTRA_MIME_TYPES)
+                }
+
                 return try {
                     startActivityForResult(chooserIntent, fileChooserResultCode)
                     true
