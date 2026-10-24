@@ -10,12 +10,16 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 
 /**
- * App-controlled Just once / Always browser picker for web links leaving SillyTavern.
- * The stored package is local to kiTavern: Android's system-wide browser default is
- * neither changed nor relied on, so "Ask every time" works even with a system default.
+ * kiTavern's external-link picker. Unlike Intent.createChooser(), this supports
+ * a per-app "Always" choice without modifying Android's browser defaults.
+ *
+ * A dedicated stored value means "follow Android's CURRENT default browser",
+ * even if the user changes that default later in Android settings.
  */
 internal object ExternalBrowserLauncher {
-    private data class Browser(val packageName: String, val label: String)
+    private const val SYSTEM_DEFAULT = "__kitavern_system_default_browser__"
+    private data class AppChoice(val packageName: String, val label: String, val isBrowser: Boolean)
+    private data class LinkChoice(val packageName: String?, val label: String)
 
     fun isExternalWebLink(context: Context, target: Uri): Boolean {
         if (target.scheme !in setOf("http", "https") || target.host.isNullOrBlank()) return false
@@ -33,31 +37,115 @@ internal object ExternalBrowserLauncher {
     }
 
     @Suppress("DEPRECATION")
-    private fun installedBrowsers(context: Context): List<Browser> {
+    private fun query(context: Context, intent: Intent): List<android.content.pm.ResolveInfo> {
         val pm = context.packageManager
-        val found = linkedMapOf<String, String>()
-        for (scheme in listOf("https", "http")) {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("$scheme://www.example.com/"))
-                .addCategory(Intent.CATEGORY_BROWSABLE)
-            val resolved = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong()))
-            } else {
-                pm.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+        // Do NOT use MATCH_DEFAULT_ONLY: it can omit browsers that are not the default.
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(0L))
+        } else {
+            pm.queryIntentActivities(intent, 0)
+        }
+    }
+
+    private fun putApp(
+        context: Context,
+        found: MutableMap<String, AppChoice>,
+        info: android.content.pm.ResolveInfo,
+        browser: Boolean
+    ) {
+        val pkg = info.activityInfo?.packageName ?: return
+        if (pkg == context.packageName || pkg == "android" || pkg.isBlank()) return
+        val label = try { info.loadLabel(context.packageManager).toString().ifBlank { pkg } }
+        catch (_: Exception) { pkg }
+        val previous = found[pkg]
+        if (previous == null || (browser && !previous.isBrowser)) {
+            found[pkg] = AppChoice(pkg, label, browser || previous?.isBrowser == true)
+        }
+    }
+
+    private fun systemDefaultPackage(context: Context): String? {
+        // RoleManager.getRoleHolders() is a hidden system API requiring a
+        // privileged permission. Ordinary apps must use public intent resolution
+        // to determine the current default handler for ordinary web links.
+        val intent = webIntent(Uri.parse("https://www.example.com/"))
+        return try {
+            @Suppress("DEPRECATION")
+            val resolved = context.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
+            resolved?.activityInfo?.packageName?.takeUnless {
+                it == "android" || it == context.packageName || it.isNullOrBlank()
             }
-            for (info in resolved) {
-                val pkg = info.activityInfo?.packageName ?: continue
-                if (pkg == context.packageName || pkg == "android") continue
-                found.putIfAbsent(pkg, info.loadLabel(pm).toString().ifBlank { pkg })
+        } catch (_: Exception) { null }
+    }
+
+    private fun webIntent(url: Uri): Intent = Intent(Intent.ACTION_VIEW, url).apply {
+        addCategory(Intent.CATEGORY_BROWSABLE)
+    }
+
+    private fun looksLikeBrowser(app: AppChoice): Boolean {
+        val s = "${app.label} ${app.packageName}".lowercase()
+        // Supplement the standard browser-app and URL intent queries: some
+        // browser launchers do not advertise CATEGORY_APP_BROWSER.
+        return listOf(
+            "browser", "firefox", "chrome", "chromium", "brave", "vivaldi",
+            "opera", "kiwi", "duckduckgo", "samsung internet", "edge", "tor browser",
+            "waterfox", "fennec", "iceraven", "cromite", "mull", "yandex",
+            "via browser", "soul browser", "vivaldi", "arc search"
+        ).any { s.contains(it) }
+    }
+
+    private fun availableApps(context: Context): List<AppChoice> {
+        val found = linkedMapOf<String, AppChoice>()
+        val defaultPkg = systemDefaultPackage(context)
+
+        // Explicit browser launcher category, which does not depend on the
+        // system's current default URL resolver.
+        val browserLaunch = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_BROWSER)
+        query(context, browserLaunch).forEach { putApp(context, found, it, browser = true) }
+
+        // Browser URL handlers, queried without MATCH_DEFAULT_ONLY.
+        for (scheme in listOf("https", "http")) {
+            for (host in listOf("www.example.com", "www.wikipedia.org")) {
+                val intent = webIntent(Uri.parse("$scheme://$host/"))
+                query(context, intent).forEach { putApp(context, found, it, browser = true) }
             }
         }
-        return found.map { (pkg, label) -> Browser(pkg, label) }
-            .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
+
+        // Settings deliberately allows any user-launchable app, even apps that
+        // aren't browsers. The manifest declares MAIN/LAUNCHER visibility.
+        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        query(context, launcher).forEach { putApp(context, found, it, browser = false) }
+
+        // In the unlikely event the browser role holder doesn't expose a
+        // matching query result, still offer its package as a browser.
+        if (!defaultPkg.isNullOrBlank() && !found.containsKey(defaultPkg)) {
+            try {
+                val pm = context.packageManager
+                @Suppress("DEPRECATION")
+                val info = pm.getApplicationInfo(defaultPkg, 0)
+                found[defaultPkg] = AppChoice(defaultPkg, pm.getApplicationLabel(info).toString(), true)
+            } catch (_: Exception) { /* Default browser remains available as a generic option. */ }
+        }
+
+        return found.values.map { app ->
+            if (app.packageName == defaultPkg || looksLikeBrowser(app)) app.copy(isBrowser = true)
+            else app
+        }.sortedWith(compareBy<AppChoice>({ !it.isBrowser }, { it.label.lowercase() }))
+    }
+
+    private fun browserChoices(context: Context): List<LinkChoice> {
+        val apps = availableApps(context).filter { it.isBrowser }
+        val defaultPackage = systemDefaultPackage(context)
+        val defaultName = apps.firstOrNull { it.packageName == defaultPackage }?.label
+        val defaultLabel = if (defaultName != null) "Default browser ($defaultName)" else "Default browser (Android)"
+        return listOf(LinkChoice(SYSTEM_DEFAULT, defaultLabel)) +
+            apps.filter { it.packageName != defaultPackage }.map { LinkChoice(it.packageName, it.label) }
     }
 
     fun selectedBrowserDescription(context: Context): String {
         val pkg = KioskPrefs.getExternalBrowserPackage(context) ?: return "Ask every time"
-        return installedBrowsers(context).firstOrNull { it.packageName == pkg }?.label
-            ?: "Unavailable browser (tap Change browser)"
+        if (pkg == SYSTEM_DEFAULT) return browserChoices(context).first().label
+        return availableApps(context).firstOrNull { it.packageName == pkg }?.label
+            ?: "Unavailable app (tap Change app)"
     }
 
     fun open(activity: Activity, url: Uri) {
@@ -66,52 +154,46 @@ internal object ExternalBrowserLauncher {
         if (pkg != null) {
             if (launch(activity, url, pkg)) return
             KioskPrefs.setExternalBrowserPackage(activity, null)
-            Toast.makeText(activity, "Saved browser unavailable. Choose another browser.", Toast.LENGTH_LONG).show()
+            Toast.makeText(activity, "Saved app cannot open web links. Choose another.", Toast.LENGTH_LONG).show()
         }
         showPicker(activity, url)
     }
 
-    private fun launch(activity: Activity, url: Uri, pkg: String): Boolean = try {
-        activity.startActivity(Intent(Intent.ACTION_VIEW, url).apply {
-            addCategory(Intent.CATEGORY_BROWSABLE)
-            setPackage(pkg)
-        })
-        true
-    } catch (_: Exception) {
-        false
+    private fun launch(activity: Activity, url: Uri, pkg: String): Boolean {
+        if (pkg == SYSTEM_DEFAULT) {
+            val actualDefault = systemDefaultPackage(activity)
+            if (!actualDefault.isNullOrBlank() && launch(activity, url, actualDefault)) return true
+            // On older Android or with no role holder: let the system choose.
+            return try {
+                activity.startActivity(webIntent(url))
+                true
+            } catch (_: Exception) { false }
+        }
+        return try {
+            activity.startActivity(webIntent(url).apply { setPackage(pkg) })
+            true
+        } catch (_: Exception) { false }
     }
 
     private fun showPicker(activity: Activity, url: Uri) {
-        val browsers = installedBrowsers(activity)
-        if (browsers.isEmpty()) {
-            // Extremely restricted Android builds may hide app discovery. Use the
-            // system chooser in that case instead of silently swallowing the link.
-            try {
-                val intent = Intent(Intent.ACTION_VIEW, url)
-                    .addCategory(Intent.CATEGORY_BROWSABLE)
-                activity.startActivity(Intent.createChooser(intent, "Open link with"))
-            } catch (_: Exception) {
-                Toast.makeText(activity, "No browser available", Toast.LENGTH_LONG).show()
-            }
-            return
-        }
-        var selected = 0
+        val choices = browserChoices(activity)
+        var selected = 0 // Default browser is the initial selection.
         AlertDialog.Builder(activity)
             .setTitle("Open link with")
-            .setSingleChoiceItems(browsers.map { it.label }.toTypedArray(), selected) { _, which ->
+            .setSingleChoiceItems(choices.map { it.label }.toTypedArray(), selected) { _, which ->
                 selected = which
             }
             .setNegativeButton("Just once") { _, _ ->
-                if (!launch(activity, url, browsers[selected].packageName)) {
-                    Toast.makeText(activity, "Unable to open this browser", Toast.LENGTH_LONG).show()
+                if (!launch(activity, url, choices[selected].packageName!!)) {
+                    Toast.makeText(activity, "Unable to open selected browser", Toast.LENGTH_LONG).show()
                 }
             }
             .setPositiveButton("Always") { _, _ ->
-                val pkg = browsers[selected].packageName
+                val pkg = choices[selected].packageName!!
                 if (launch(activity, url, pkg)) {
                     KioskPrefs.setExternalBrowserPackage(activity, pkg)
                 } else {
-                    Toast.makeText(activity, "Unable to open this browser", Toast.LENGTH_LONG).show()
+                    Toast.makeText(activity, "Unable to open selected browser", Toast.LENGTH_LONG).show()
                 }
             }
             .setNeutralButton("Cancel", null)
@@ -119,21 +201,38 @@ internal object ExternalBrowserLauncher {
     }
 
     fun chooseInSettings(activity: Activity, onChanged: () -> Unit) {
-        val browsers = installedBrowsers(activity)
-        if (browsers.isEmpty()) {
-            Toast.makeText(activity, "No browsers found", Toast.LENGTH_LONG).show()
-            return
-        }
+        val choices = availableApps(activity)
+        val defaultLabel = browserChoices(activity).first().label
+        // All user-launchable apps are exposed in Settings. Apps that aren't
+        // web handlers may be selected; on opening a link we fail safely back
+        // to the picker rather than losing the link or navigating in WebView.
+        val allChoices = listOf(LinkChoice(SYSTEM_DEFAULT, defaultLabel)) +
+            choices.map { app ->
+                val prefix = if (app.isBrowser) "" else "Other app: "
+                LinkChoice(app.packageName, "$prefix${app.label}")
+            }
         val current = KioskPrefs.getExternalBrowserPackage(activity)
-        var selected = browsers.indexOfFirst { it.packageName == current }.coerceAtLeast(0)
+        var selected = allChoices.indexOfFirst { it.packageName == current }.coerceAtLeast(0)
         AlertDialog.Builder(activity)
-            .setTitle("External links browser")
-            .setSingleChoiceItems(browsers.map { it.label }.toTypedArray(), selected) { _, which ->
+            .setTitle("External links app")
+            .setSingleChoiceItems(allChoices.map { it.label }.toTypedArray(), selected) { _, which ->
                 selected = which
             }
-            .setPositiveButton("Use selected browser") { _, _ ->
-                KioskPrefs.setExternalBrowserPackage(activity, browsers[selected].packageName)
-                onChanged()
+            .setPositiveButton("Use selected app") { _, _ ->
+                val choice = allChoices[selected]
+                if (choice.label.startsWith("Other app: ")) {
+                    AlertDialog.Builder(activity)
+                        .setTitle("App may not open web links")
+                        .setMessage("This app may not support opening web pages. If it cannot open a link, kiTavern will ask you to choose again.")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Use anyway") { _, _ ->
+                            KioskPrefs.setExternalBrowserPackage(activity, choice.packageName)
+                            onChanged()
+                        }.show()
+                } else {
+                    KioskPrefs.setExternalBrowserPackage(activity, choice.packageName)
+                    onChanged()
+                }
             }
             .setNegativeButton("Cancel", null)
             .show()

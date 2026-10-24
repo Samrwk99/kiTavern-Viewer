@@ -93,7 +93,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Change browser"
+                android:text="Change app"
                 android:minHeight="48dp"
                 android:layout_marginEnd="8dp"/>
 
@@ -110,7 +110,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="External web pages open in your chosen browser, not inside SillyTavern."
+            android:text="Choose the Android default browser, another browser, or any listed app. Apps that cannot open web links will trigger the picker again."
             android:textSize="12sp"
             android:textColor="?android:attr/textColorHint"
             android:layout_marginTop="4dp"/>
