@@ -69,6 +69,55 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:text="External Links"
+            android:textSize="16sp"
+            android:textColor="?android:attr/textColorSecondary"
+            android:layout_marginTop="24dp"
+            android:layout_marginBottom="8dp"/>
+
+        <TextView
+            android:id="@+id/textExternalBrowserStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Current: Ask every time"
+            android:textColor="?android:attr/textColorSecondary"
+            android:layout_marginBottom="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/buttonChooseExternalBrowser"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Change browser"
+                android:minHeight="48dp"
+                android:layout_marginEnd="8dp"/>
+
+            <Button
+                android:id="@+id/buttonResetExternalBrowser"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Ask every time"
+                android:minHeight="48dp"
+                android:layout_marginStart="8dp"/>
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="External web pages open in your chosen browser, not inside SillyTavern."
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorHint"
+            android:layout_marginTop="4dp"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:text="Keep Screen On"
             android:textSize="16sp"
             android:textColor="?android:attr/textColorSecondary"

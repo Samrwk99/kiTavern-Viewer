@@ -13,6 +13,9 @@ import android.net.Uri
 import android.graphics.Point
 import android.os.Build
 import android.os.Bundle
+import android.os.Message
+import android.os.Handler
+import android.os.Looper
 import android.os.Environment
 import android.util.Log
 import android.view.MotionEvent
@@ -709,6 +712,9 @@ class MainActivity : AppCompatActivity() {
             allowFileAccess = true
             allowContentAccess = true
             mediaPlaybackRequiresUserGesture = false
+            // Handle target=_blank and user-initiated window.open links externally.
+            setSupportMultipleWindows(true)
+            javaScriptCanOpenWindowsAutomatically = false
         }
 
         CookieManager.getInstance().setAcceptCookie(true)
@@ -820,7 +826,8 @@ class MainActivity : AppCompatActivity() {
 
         view.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val requestedUrl = request?.url?.toString() ?: return false
+                val navigation = request ?: return false
+                val requestedUrl = navigation.url.toString()
 
                 if (requestedUrl.startsWith("blob:")) {
                     handleBlobDownload(view, requestedUrl)
@@ -829,6 +836,15 @@ class MainActivity : AppCompatActivity() {
 
                 if (requestedUrl.startsWith("data:")) {
                     handleDataUrlDownload(requestedUrl)
+                    return true
+                }
+
+                // Internal SillyTavern links stay in this WebView. Web links to other
+                // origins leave the app; never replace the active chat with a web page.
+                if (navigation.isForMainFrame && ExternalBrowserLauncher.isExternalWebLink(
+                        this@MainActivity, navigation.url
+                    )) {
+                    ExternalBrowserLauncher.open(this@MainActivity, navigation.url)
                     return true
                 }
 
@@ -890,6 +906,59 @@ class MainActivity : AppCompatActivity() {
         }
 
         view.webChromeClient = object : WebChromeClient() {
+            override fun onCreateWindow(
+                view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?
+            ): Boolean {
+                // Accept only user-triggered popups. SillyTavern's own page stays put.
+                if (!isUserGesture || resultMsg == null) return false
+                val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+                val child = WebView(this@MainActivity)
+                var handedOff = false
+                val mainHandler = Handler(Looper.getMainLooper())
+
+                fun closeChild() {
+                    mainHandler.post {
+                        try {
+                            child.stopLoading()
+                            child.webViewClient = WebViewClient()
+                            child.destroy()
+                        } catch (_: Exception) { }
+                    }
+                }
+
+                fun routePopup(address: String?): Boolean {
+                    if (handedOff || address.isNullOrBlank() || address == "about:blank") return false
+                    val uri = try { Uri.parse(address) } catch (_: Exception) { return false }
+                    if (uri.scheme !in setOf("http", "https")) return false
+                    handedOff = true
+                    ExternalBrowserLauncher.open(this@MainActivity, uri)
+                    closeChild()
+                    return true
+                }
+
+                child.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        view: WebView?, request: WebResourceRequest?
+                    ): Boolean {
+                        if (request?.isForMainFrame == true && routePopup(request.url.toString())) {
+                            return true
+                        }
+                        return false
+                    }
+
+                    override fun onPageStarted(
+                        view: WebView?, url: String?, favicon: android.graphics.Bitmap?
+                    ) {
+                        if (!handedOff) routePopup(url)
+                    }
+                }
+                // Discard abandoned/about:blank windows without retaining extra renderers.
+                mainHandler.postDelayed({ if (!handedOff) closeChild() }, 10_000L)
+                transport.webView = child
+                resultMsg.sendToTarget()
+                return true
+            }
+
             override fun onConsoleMessage(message: android.webkit.ConsoleMessage): Boolean {
                 if (diagnosticsEnabled && message.message().startsWith("[kiTavern-heartbeat]")) {
                     Log.w("KiTavernDiagnostics", message.message())
