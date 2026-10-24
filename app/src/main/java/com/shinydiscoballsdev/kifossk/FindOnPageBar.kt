@@ -16,6 +16,8 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.webkit.WebView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 /** Lightweight browser-style find bar backed by WebView's own find/highlight APIs. */
 internal class FindOnPageBar(private val activity: MainActivity) {
@@ -87,6 +89,11 @@ internal class FindOnPageBar(private val activity: MainActivity) {
         actionButton("▼", "Next match") { currentWebView?.findNext(true) }
         actionButton("✕", "Close find on page") { dismiss() }
 
+        // This Activity renders edge-to-edge; don't place the find bar under
+        // the Android status bar or a display cutout.
+        val statusTop = ViewCompat.getRootWindowInsets(host)?.getInsets(
+            WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.displayCutout()
+        )?.top ?: 0
         val layoutParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -94,7 +101,7 @@ internal class FindOnPageBar(private val activity: MainActivity) {
         ).apply {
             leftMargin = dp(8)
             rightMargin = dp(8)
-            topMargin = dp(8)
+            topMargin = statusTop + dp(8)
         }
         host.addView(row, layoutParams)
 
