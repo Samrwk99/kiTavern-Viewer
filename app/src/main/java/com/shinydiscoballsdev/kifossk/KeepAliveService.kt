@@ -14,12 +14,6 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 
-/**
- * Long-lived, user-enabled foreground service. Its lifetime is governed by the
- * Keep Alive preference, not by MainActivity's lifecycle or notification detail
- * preference. It deliberately does not own the WebView: Android WebView instances
- * need an Activity context and UI attachment.
- */
 class KeepAliveService : Service() {
 
     companion object {
@@ -52,6 +46,19 @@ class KeepAliveService : Service() {
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // Same Intent/flags on every call, so the PendingIntent can be created once and reused.
+    private val openAppPendingIntent: PendingIntent by lazy(LazyThreadSafetyMode.NONE) {
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        PendingIntent.getActivity(
+            this,
+            0,
+            openAppIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -94,20 +101,11 @@ class KeepAliveService : Service() {
 
     private fun buildNotification(): Notification {
         val showDetails = KioskPrefs.getShowNotification(this)
-        val openAppIntent = Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        }
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            openAppIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_info_details)
             .setContentTitle("SillyTavern")
-            .setContentIntent(pendingIntent)
+            .setContentIntent(openAppPendingIntent)
             .setOngoing(true)
             .setSilent(true)
             .setOnlyAlertOnce(true)
@@ -129,8 +127,10 @@ class KeepAliveService : Service() {
         val lock = wakeLock ?: powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "$packageName:KeepAlive"
-        ).also { wakeLock = it }
-        lock.setReferenceCounted(false)
+        ).also {
+            it.setReferenceCounted(false)
+            wakeLock = it
+        }
         if (!lock.isHeld) {
             // Intentionally held only while the user enables Keep Alive. This increases battery use.
             lock.acquire()

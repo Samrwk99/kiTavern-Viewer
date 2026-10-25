@@ -46,9 +46,9 @@
         return !!(node && (node === chat || chat.contains(node)));
     }
     function report(force) {
-        if (!document.getElementById('chat') || !window.STSelectionBridge) return;
         var now = performance.now();
         if (!force && now - lastReportTime < 24) return;
+        if (!document.getElementById('chat') || !window.STSelectionBridge) return;
         lastReportTime = now;
         var s = window.getSelection();
         var inChatSelection = !!(s && s.rangeCount === 1 && !s.isCollapsed &&

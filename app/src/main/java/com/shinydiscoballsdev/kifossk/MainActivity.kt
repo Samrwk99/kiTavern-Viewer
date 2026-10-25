@@ -8,7 +8,6 @@ import android.content.MutableContextWrapper
 import android.content.pm.ApplicationInfo
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Color
 import android.net.Uri
 import android.graphics.Point
 import android.os.Build
@@ -82,7 +81,6 @@ class MainActivity : AppCompatActivity() {
     private var settingsFragment: SettingsFragment? = null
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingWebPermission: PermissionRequest? = null
-    private val fileChooserResultCode = 1
 
     private lateinit var noPagePinger: NoPagePinger
     private var activityResumed = false
@@ -99,6 +97,7 @@ class MainActivity : AppCompatActivity() {
     private var lastLiftOcclusion = Int.MIN_VALUE
     private var lastLiftHeight = Int.MIN_VALUE
     private var lastLiftTarget: WebView? = null
+    private val liftLocation = IntArray(2)
     private val keyboardLiftUpdate = Runnable {
         keyboardLiftUpdateScheduled = false
         pushKeyboardLiftToWebView()
@@ -107,8 +106,10 @@ class MainActivity : AppCompatActivity() {
         if (keyboardIsVisible) scheduleKeyboardLiftUpdate()
     }
 
-    private val diagnosticsEnabled: Boolean
-        get() = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+    // The debuggable flag is fixed for the life of the process; read it once.
+    private val diagnosticsEnabled: Boolean by lazy(LazyThreadSafetyMode.NONE) {
+        applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+    }
 
 
     // Retain the download bridge with the live WebView so in-flight downloads
@@ -133,222 +134,15 @@ class MainActivity : AppCompatActivity() {
         private const val STATE_WEBVIEW = "kiTavern_webview_state"
         private const val STATE_LAST_URL = "kiTavern_last_url"
         private const val NO_PAGE_ASSET_URL = "file:///android_asset/nopage.html"
-    }
+        private const val FILE_CHOOSER_RESULT_CODE = 1
+        // Same value Color.parseColor("#1a1a2e") returns; computed once.
+        private val BACKGROUND_COLOR = 0xFF1A1A2E.toInt()
+        private const val FOCUS_POLICY_PLACEHOLDER = "__AUTO_FOCUS__"
 
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { results ->
-        results.forEach { (permission, granted) ->
-            Log.d("Permissions", "$permission: ${if (granted) "granted" else "denied"}")
-        }
-        completePendingWebPermission()
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        applyTheme()
-        super.onCreate(savedInstanceState)
-        requestPermissionsIfNeeded()
-
-        configureKeyboardInsets()
-        container = FrameLayout(this)
-        container.setBackgroundColor(Color.parseColor("#1a1a2e"))
-        setContentView(container)
-        installKeyboardInsetsListener()
-        // Window panning can move the WebView without changing IME inset height.
-        // Observe the Activity container (not the retained WebView) for those moves.
-        container.viewTreeObserver.addOnGlobalLayoutListener(keyboardLayoutListener)
-
-        // A restored settings overlay must be rebound to this Activity instance.
-        settingsFragment = supportFragmentManager.findFragmentByTag(SETTINGS_TAG) as? SettingsFragment
-        settingsFragment?.let(::bindSettingsCallbacks)
-
-        noPagePinger = NoPagePinger(
-            targetUrlProvider = { currentNoPageRetryUrl() },
-            shouldPing = { shouldPingNoPageTarget() },
-            onSuccessfulPing = { target -> recoverFromNoPageIfIdle(target) }
-        )
-
-        setupWebView(savedInstanceState)
-
-        // Start independently of the Activity lifecycle. Never stop the service in onDestroy().
-        if (KioskPrefs.getKeepAlive(this)) {
-            KeepAliveService.start(this)
-        }
-
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                if (findOnPageBar?.dismiss() == true) return
-                if (settingsFragment != null) closeSettings() else showSettings()
-            }
-        })
-    }
-
-    private fun applyTheme() {
-        val theme = KioskPrefs.getTheme(this)
-        setTheme(if (theme == "light") R.style.Theme_KioskViewer_Light else R.style.Theme_KioskViewer)
-    }
-
-    /**
-     * Trial of the Stack Overflow adjustPan + page-side keyboard positioning.
-     * Do not combine it with the old native IME padding/adjustResize behaviour.
-     * We retain edge-to-edge for the existing native Settings presentation.
-     */
-    private fun configureKeyboardInsets() {
-        @Suppress("DEPRECATION")
-        updateKeyboardStartupMode()
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-    }
-
-    /** Keep Android's initial IME state hidden when chat auto-focus is disabled. */
-    private fun updateKeyboardStartupMode() {
-        val state = if (KioskPrefs.getAutoFocusChatInput(this)) 0 else
-            WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
-        @Suppress("DEPRECATION")
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or state)
-    }
-
-    /** SillyTavern focuses #send_textarea programmatically on chat changes.
-     *  Ignore that automatic focus only when the setting is off; explicit taps
-     *  on the composer still focus it normally. Other websites are untouched.
-     */
-    private fun updateChatFocusPolicy(target: WebView) {
-        if (!UrlValidator.isValid(target.url)) return
-        val autoFocus = KioskPrefs.getAutoFocusChatInput(this)
-        target.evaluateJavascript(
+        // Injected page scripts. They are static, so build each one lazily and only once
+        // instead of re-running trimIndent() over the same text on every page load.
+        private val KEYBOARD_LIFT_SCRIPT: String by lazy(LazyThreadSafetyMode.NONE) {
             """
-            (function() {
-                var state = window.__kiTavernFocusPolicy;
-                if (!state) {
-                    state = {autoFocus: true, allowedUntil: 0};
-                    window.__kiTavernFocusPolicy = state;
-                    function isComposer(el) {
-                        return el && el.nodeType === 1 &&
-                            (el.id === 'send_textarea' ||
-                             (el.closest && el.closest('#send_textarea')));
-                    }
-                    // Only an actual interaction with the composer opts in to
-                    // keyboard focus. Clicking a message/chat elsewhere doesn't.
-                    function allowUserFocus(e) {
-                        if (isComposer(e.target))
-                            state.allowedUntil = performance.now() + 1600;
-                    }
-                    document.addEventListener('pointerdown', allowUserFocus, true);
-                    document.addEventListener('touchstart', allowUserFocus, true);
-                    document.addEventListener('mousedown', allowUserFocus, true);
-                    document.addEventListener('focusin', function(e) {
-                        if (!state.autoFocus && isComposer(e.target) &&
-                            performance.now() > state.allowedUntil) {
-                            e.target.blur();
-                        }
-                    }, true);
-                }
-                state.autoFocus = $autoFocus;
-                if (!state.autoFocus && document.activeElement &&
-                    (document.activeElement.id === 'send_textarea' ||
-                     (document.activeElement.closest &&
-                      document.activeElement.closest('#send_textarea'))) &&
-                    performance.now() > state.allowedUntil) {
-                    document.activeElement.blur();
-                }
-            })();
-            """.trimIndent(), null
-        )
-    }
-
-    private fun installKeyboardInsetsListener() {
-        val root = findViewById<FrameLayout>(android.R.id.content)
-        val barsAndCutout = WindowInsetsCompat.Type.systemBars() or
-            WindowInsetsCompat.Type.displayCutout()
-        val handledTypes = barsAndCutout or WindowInsetsCompat.Type.ime()
-
-        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
-            val bars = insets.getInsets(barsAndCutout)
-            // Keep only system-bar padding for both WebView and the native overlay.
-            // IME padding here would shrink WebView and double-count the JS adjustment.
-            if (view.paddingLeft != bars.left || view.paddingTop != bars.top ||
-                view.paddingRight != bars.right || view.paddingBottom != bars.bottom
-            ) {
-                view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-            }
-
-            val visible = insets.isVisible(WindowInsetsCompat.Type.ime())
-            val bottom = if (visible) insets.getInsets(WindowInsetsCompat.Type.ime()).bottom else 0
-            if (keyboardIsVisible != visible || keyboardInsetBottomPx != bottom) {
-                keyboardIsVisible = visible
-                keyboardInsetBottomPx = bottom
-                scheduleKeyboardLiftUpdate()
-            }
-
-            // We handle IME occlusion in JavaScript. Tell WebView that this inset
-            // has been handled, avoiding modern WebView's second viewport resize.
-            WindowInsetsCompat.Builder(insets)
-                .setInsets(handledTypes, Insets.NONE)
-                .setVisible(WindowInsetsCompat.Type.ime(), false)
-                .build()
-        }
-        ViewCompat.requestApplyInsets(root)
-    }
-
-    private fun scheduleKeyboardLiftUpdate() {
-        if (!::container.isInitialized) return
-        // Coalesce IME and layout callbacks into at most one update per frame.
-        if (!keyboardLiftUpdateScheduled) {
-            keyboardLiftUpdateScheduled = true
-            container.postOnAnimation(keyboardLiftUpdate)
-        }
-    }
-
-    /** In screen coordinates so adjustPan's own window movement is not counted twice. */
-    private fun getWindowScreenBottomPx(): Int {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            return windowManager.currentWindowMetrics.bounds.bottom
-        }
-        val size = Point()
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealSize(size)
-        return size.y
-    }
-
-    private fun pushKeyboardLiftToWebView() {
-        if (!::webView.isInitialized || !webView.isAttachedToWindow ||
-            !UrlValidator.isValid(webView.url) || webView.height <= 0
-        ) return
-
-        // Calculate only the part of the *currently positioned* WebView actually
-        // hidden by the keyboard. This avoids blindly moving the bar by the full
-        // IME height if Android has already panned the window upward.
-        val location = IntArray(2)
-        webView.getLocationOnScreen(location)
-        val obscuredPx = if (keyboardIsVisible && settingsFragment == null) {
-            val keyboardTop = getWindowScreenBottomPx() - keyboardInsetBottomPx
-            (location[1] + webView.height - keyboardTop).coerceIn(0, webView.height)
-        } else {
-            0
-        }
-        // Avoid invoking JavaScript for every unrelated global layout pass.
-        if (lastLiftTarget === webView && lastLiftOcclusion == obscuredPx &&
-            lastLiftHeight == webView.height
-        ) return
-        lastLiftTarget = webView
-        lastLiftOcclusion = obscuredPx
-        lastLiftHeight = webView.height
-        webView.evaluateJavascript(
-            "window.__kiTavernKeyboardLift && " +
-                "window.__kiTavernKeyboardLift.setOcclusion($obscuredPx, ${webView.height});",
-            null
-        )
-    }
-
-    private fun invalidateKeyboardLift() {
-        lastLiftTarget = null
-        lastLiftOcclusion = Int.MIN_VALUE
-        lastLiftHeight = Int.MIN_VALUE
-    }
-
-    /** Injected only into normal HTTP(S) pages; nopage.html needs no keyboard code. */
-    private fun installKeyboardLift(target: WebView) {
-        if (!UrlValidator.isValid(target.url)) return
-        val script = """
             (function () {
                 if (window.__kiTavernKeyboardLift) return;
                 var hiddenPx = 0;
@@ -511,689 +305,58 @@ class MainActivity : AppCompatActivity() {
                     window.visualViewport.addEventListener('scroll', schedule);
                 }
             })();
-        """.trimIndent()
-        target.evaluateJavascript(script) { _ ->
-            if (::webView.isInitialized && webView === target) scheduleKeyboardLiftUpdate()
-        }
-    }
-
-    /** Applies runtime preferences without navigating/reloading the WebView. */
-    private fun applyRuntimeSettings() {
-        val wantedOrientation = when (KioskPrefs.getOrientation(this)) {
-            "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            "portrait" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            else -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
-        if (requestedOrientation != wantedOrientation) requestedOrientation = wantedOrientation
-
-        updateKeyboardStartupMode()
-        if (::webView.isInitialized) updateChatFocusPolicy(webView)
-
-        if (KioskPrefs.getScreenOn(this)) {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        } else {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
-    }
-
-    private fun isCurrentPageOrigin(origin: Uri): Boolean {
-        if (!::webView.isInitialized) return false
-        val page = Uri.parse(webView.url ?: return false)
-        val firstScheme = page.scheme?.lowercase() ?: return false
-        if (firstScheme != "http" && firstScheme != "https") return false
-        if (!firstScheme.equals(origin.scheme, ignoreCase = true) ||
-            !page.host.equals(origin.host, ignoreCase = true)
-        ) return false
-        fun effectivePort(uri: Uri): Int = when {
-            uri.port >= 0 -> uri.port
-            uri.scheme.equals("https", ignoreCase = true) -> 443
-            else -> 80
-        }
-        return effectivePort(page) == effectivePort(origin)
-    }
-
-    private fun requiredAndroidMediaPermissions(request: PermissionRequest): List<String> =
-        request.resources.mapNotNull { resource ->
-            when (resource) {
-                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
-                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
-                else -> null
-            }
-        }.distinct()
-
-    private fun completePendingWebPermission() {
-        val request = pendingWebPermission ?: return
-        pendingWebPermission = null
-        if (!isCurrentPageOrigin(request.origin)) {
-            request.deny()
-            return
-        }
-        val allowed = request.resources.filter { resource ->
-            val permission = when (resource) {
-                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
-                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
-                else -> null
-            }
-            permission != null && ContextCompat.checkSelfPermission(this, permission) ==
-                PackageManager.PERMISSION_GRANTED
-        }
-        if (allowed.isEmpty()) request.deny() else request.grant(allowed.toTypedArray())
-    }
-
-    private fun requestPermissionsIfNeeded() {
-        val permissions = mutableListOf<String>()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            permissions += Manifest.permission.POST_NOTIFICATIONS
-        }
-        // Request camera/microphone only if a webpage actually asks for them.
-        // This avoids prompts and system work on an ordinary kiosk launch.
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
-        ) {
-            permissions += Manifest.permission.WRITE_EXTERNAL_STORAGE
+            """.trimIndent()
         }
 
-        if (permissions.isNotEmpty()) requestPermissionLauncher.launch(permissions.toTypedArray())
-    }
-
-    private fun setupWebView(savedInstanceState: Bundle?) {
-        applyRuntimeSettings()
-        val forceReload = intent?.getBooleanExtra(EXTRA_RELOAD, false) == true
-        val retained = lastCustomNonConfigurationInstance as? RetainedBrowser
-        retainedDownloadBridge = retained?.downloads
-        val retainedWebView = retained?.view
-        webView = createConfiguredWebView(retainedWebView)
-        // Use the same JS bridge and touch-handle listeners after a retained WebView
-        // moves to a recreated Activity. Do not install duplicate listeners.
-        selectionAutoScroller = retained?.selectionAutoScroller
-            ?: SillyTavernSelectionAutoScroller(webView)
-        container.addView(
-            webView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-        )
-        // A retained/restored WebView may never fire onPageFinished again.
-        webView.post {
-            installKeyboardLift(webView)
-            updateChatFocusPolicy(webView)
-            installScrollbarDrag(webView)
-            installNativeSelectionBoundaries(webView)
-        }
-
-        // If this is a configuration/recreation hand-off, keep the same WebView object
-        // and its live DOM/JS heap. An explicit EXTRA_RELOAD still overrides retention.
-        if (retainedWebView != null) {
-            mainFrameLoading = retainedWebView.progress < 100
-            noPageAssetPageFinished = !forceReload && !mainFrameLoading &&
-                isNoPageAssetUrl(retainedWebView.url)
-            if (forceReload) webView.loadUrl(KioskPrefs.getUrl(this))
-            intent?.removeExtra(EXTRA_RELOAD)
-            updateNoPagePinger()
-            return
-        }
-
-        val previousWebViewState = savedInstanceState?.getBundle(STATE_WEBVIEW)
-        val restoredHistory = if (!forceReload && previousWebViewState != null) {
-            try {
-                webView.restoreState(previousWebViewState)
-            } catch (e: Exception) {
-                Log.w(TAG, "WebView navigation state could not be restored", e)
-                null
-            }
-        } else {
-            null
-        }
-
-        when {
-            forceReload -> webView.loadUrl(KioskPrefs.getUrl(this))
-            restoredHistory == null || webView.url.isNullOrBlank() -> {
-                val savedUrl = savedInstanceState?.getString(STATE_LAST_URL)
-                    ?.takeIf { UrlValidator.isValid(it) || isNoPageAssetUrl(it) }
-                // Only navigate if WebView state restoration failed. Normal Activity
-                // resume/return-to-app paths never reload the current SillyTavern page.
-                webView.loadUrl(savedUrl ?: KioskPrefs.getUrl(this))
-            }
-            else -> Log.d(TAG, "Restored WebView back/forward state at ${webView.url}")
-        }
-
-        // Restoring history may not produce another onPageFinished() callback.
-        // Resume checking if the local fallback is already fully displayed.
-        if (!forceReload && restoredHistory != null &&
-            isNoPageAssetUrl(webView.url) && webView.progress >= 100
-        ) {
-            mainFrameLoading = false
-            noPageAssetPageFinished = true
-        }
-
-        // Do not let a one-shot explicit reload extra cause another reload on recreation.
-        intent?.removeExtra(EXTRA_RELOAD)
-        updateNoPagePinger()
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun createConfiguredWebView(existing: WebView? = null): WebView {
-        // A mutable context prevents our explicitly retained WebView from pinning an
-        // obsolete Activity after configuration/theme recreation.
-        val view = existing ?: FindOnPageWebView(MutableContextWrapper(this))
-        (view.context as? MutableContextWrapper)?.baseContext = this
-        // Rebind after Activity recreation: the retained WebView must not keep
-        // a callback referencing the previous Activity instance.
-        (view as? FindOnPageWebView)?.onFindOnPageRequested = { selectedText ->
-            if (!isFinishing && !isDestroyed) {
-                val findBar = findOnPageBar ?: FindOnPageBar(this).also { findOnPageBar = it }
-                findBar.show(view, selectedText)
-            }
-        }
-        view.setBackgroundColor(Color.parseColor("#1a1a2e"))
-        // Disable Android's overscroll edge glow; the thumb highlight is CSS-only.
-        view.overScrollMode = android.view.View.OVER_SCROLL_NEVER
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // Keep the renderer at important priority even when this WebView is not visible.
-            // This reduces (but cannot eliminate) renderer process reclamation.
-            view.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
-        }
-
-        view.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            builtInZoomControls = true
-            displayZoomControls = false
-            useWideViewPort = true
-            loadWithOverviewMode = true
-            cacheMode = WebSettings.LOAD_DEFAULT
-            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-            allowFileAccess = true
-            allowContentAccess = true
-            mediaPlaybackRequiresUserGesture = false
-            // Handle target=_blank and user-initiated window.open links externally.
-            setSupportMultipleWindows(true)
-            javaScriptCanOpenWindowsAutomatically = false
-        }
-
-        CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
-        if (existing == null) {
-            view.addJavascriptInterface(blobDownloader, "BlobDownloader")
-        }
-        // Reuse the bridge with retained WebViews (rotation does not re-inject
-        // JavaScript interfaces into an already-loaded page).
-        val scrollbarBridge = (view.tag as? ScrollbarTouchBridge)
-            ?: ScrollbarTouchBridge().also {
-                view.tag = it
-                view.addJavascriptInterface(it, "KiTavernScrollbarTouch")
-            }
-
-        // Keep Chromium's built-in text selection and native Android handles.
-        // Only the existing dedicated scrollbar-thumb gesture is intercepted;
-        // every other touch/long press goes directly to WebView.
-        var nativeScrollbarTouch = false
-        var nativeScrollbarPointerId = -1
-        var nativeScrollbarY = 0f
-        var nativeScrollbarScope = ""
-        var nativeScrollbarFrameQueued = false
-        // Keep no more than one move pending on the UI thread. Renderer messages
-        // for 120Hz touch screens must not accumulate faster than paint frames.
-        val nativeScrollbarMoveFrame = object : Runnable {
-            override fun run() {
-                nativeScrollbarFrameQueued = false
-                if (nativeScrollbarTouch) {
-                    view.evaluateJavascript(
-                        "window.__kiTavernScrollbarNative && " +
-                            "window.__kiTavernScrollbarNative.move($nativeScrollbarY);", null
-                    )
-                }
-            }
-        }
-        fun nativeScrollbarEnd(cancel: Boolean) {
-            if (!nativeScrollbarTouch) return
-            nativeScrollbarTouch = false
-            nativeScrollbarPointerId = -1
-            nativeScrollbarFrameQueued = false
-            view.removeCallbacks(nativeScrollbarMoveFrame)
-            view.evaluateJavascript(
-                "window.__kiTavernScrollbarNative && " +
-                    "window.__kiTavernScrollbarNative.end(${if (cancel) "true" else "false"},$nativeScrollbarY);",
-                null
-            )
-        }
-        fun thumbPress(event: MotionEvent): ScrollbarTouchBridge.Bounds? {
-            if (!UrlValidator.isValid(view.url) || view.width <= 0 || view.height <= 0) return null
-            val bounds = scrollbarBridge.bounds ?: return null
-            val x = event.x * bounds.viewportWidth / view.width
-            val y = event.y * bounds.viewportHeight / view.height
-            return bounds.takeIf {
-                x >= it.right - 32f && x <= it.right + 3f &&
-                    y >= it.top && y <= it.bottom
-            }
-        }
-        view.setOnTouchListener { _, event ->
-            // Intercept at the Android View boundary *before* Chromium can claim
-            // the native scrollbar drag on the compositor. Otherwise it may
-            // move without our blue pressed state and race the JS scroll guard.
-            if (nativeScrollbarTouch) {
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_MOVE -> {
-                        if (event.pointerCount != 1 ||
-                            event.getPointerId(0) != nativeScrollbarPointerId) {
-                            nativeScrollbarEnd(true)
-                        } else {
-                            val geometry = scrollbarBridge.bounds
-                            if (geometry != null) {
-                                nativeScrollbarY = event.y * geometry.viewportHeight / view.height
-                                if (!nativeScrollbarFrameQueued) {
-                                    nativeScrollbarFrameQueued = true
-                                    view.postOnAnimation(nativeScrollbarMoveFrame)
-                                }
-                            }
-                        }
-                    }
-                    MotionEvent.ACTION_UP -> {
-                        val geometry = scrollbarBridge.bounds
-                        if (geometry != null && view.height > 0)
-                            nativeScrollbarY = event.y * geometry.viewportHeight / view.height
-                        nativeScrollbarEnd(false)
-                    }
-                    MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> nativeScrollbarEnd(true)
-                }
-                return@setOnTouchListener true
-            }
-            if (event.actionMasked == MotionEvent.ACTION_DOWN && event.pointerCount == 1) {
-                val hit = thumbPress(event)
-                if (hit != null) {
-                    nativeScrollbarTouch = true
-                    nativeScrollbarPointerId = event.getPointerId(0)
-                    nativeScrollbarScope = hit.scope
-                    nativeScrollbarY = event.y * hit.viewportHeight / view.height
-                    val x = event.x * hit.viewportWidth / view.width
-                    // Zero velocity cancels an in-flight WebView fling at the
-                    // Android boundary, before the dedicated drag takes control.
-                    view.flingScroll(0, 0)
-                    view.evaluateJavascript(
-                        "window.__kiTavernScrollbarNative && " +
-                            "window.__kiTavernScrollbarNative.down($x,$nativeScrollbarY,'$nativeScrollbarScope');",
-                        null
-                    )
-                    return@setOnTouchListener true
-                }
-            }
-            false // Let WebView/Chromium own native selection, editing and scrolling.
-        }
-
-        view.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val navigation = request ?: return false
-                val requestedUrl = navigation.url.toString()
-
-                if (requestedUrl.startsWith("blob:")) {
-                    handleBlobDownload(view, requestedUrl)
-                    return true
-                }
-
-                if (requestedUrl.startsWith("data:")) {
-                    handleDataUrlDownload(requestedUrl)
-                    return true
-                }
-
-                // Internal SillyTavern links stay in this WebView. Web links to other
-                // origins leave the app; never replace the active chat with a web page.
-                if (navigation.isForMainFrame && ExternalBrowserLauncher.isExternalWebLink(
-                        this@MainActivity, navigation.url
-                    )) {
-                    ExternalBrowserLauncher.open(this@MainActivity, navigation.url)
-                    return true
-                }
-
-                return false
-            }
-
-            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                findOnPageBar?.dismiss()
-                selectionAutoScroller?.onNavigationStarted()
-                scrollbarBridge.bounds = null
-                super.onPageStarted(view, url, favicon)
-                invalidateKeyboardLift()
-                // Only ping when the local fallback has fully loaded and is idle.
-                mainFrameLoading = true
-                recoveryNavigationPending = false
-                noPageAssetPageFinished = false
-                updateNoPagePinger()
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                super.onPageFinished(view, url)
-                if (view != null) {
-                    injectBlobInterceptor(view)
-                    installKeyboardLift(view)
-                    updateChatFocusPolicy(view)
-                    installScrollbarDrag(view)
-                    installNativeSelectionBoundaries(view)
-                    installDebugHeartbeat(view)
-                }
-                mainFrameLoading = false
-                recoveryNavigationPending = false
-                noPageAssetPageFinished = isNoPageAssetUrl(url ?: view?.url)
-                updateNoPagePinger()
-            }
-
-            override fun onReceivedError(
-                view: WebView?,
-                request: WebResourceRequest?,
-                error: WebResourceError?
-            ) {
-                super.onReceivedError(view, request, error)
-                // Subresource failures must not replace the entire page with nopage.html.
-                if (request?.isForMainFrame != true) return
-
-                val failedUrl = request.url.toString()
-                val encodedUrl = URLEncoder.encode(failedUrl, Charsets.UTF_8.name())
-                view?.loadUrl("$NO_PAGE_ASSET_URL?url=$encodedUrl")
-            }
-
-            override fun onRenderProcessGone(
-                view: WebView,
-                detail: RenderProcessGoneDetail
-            ): Boolean {
-                Log.e(TAG, "WebView renderer exited; didCrash=${detail.didCrash()}")
-                recoverWebViewAfterRendererExit(view)
-                // Returning true says that this Activity handled the dead WebView.
-                return true
-            }
-        }
-
-        view.webChromeClient = object : WebChromeClient() {
-            override fun onCreateWindow(
-                view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?
-            ): Boolean {
-                // Accept only user-triggered popups. SillyTavern's own page stays put.
-                if (!isUserGesture || resultMsg == null) return false
-                val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
-                val child = WebView(this@MainActivity)
-                var handedOff = false
-                val mainHandler = Handler(Looper.getMainLooper())
-
-                fun closeChild() {
-                    mainHandler.post {
-                        try {
-                            child.stopLoading()
-                            child.webViewClient = WebViewClient()
-                            child.destroy()
-                        } catch (_: Exception) { }
-                    }
-                }
-
-                fun routePopup(address: String?): Boolean {
-                    if (handedOff || address.isNullOrBlank() || address == "about:blank") return false
-                    val uri = try { Uri.parse(address) } catch (_: Exception) { return false }
-                    if (uri.scheme !in setOf("http", "https")) return false
-                    handedOff = true
-                    ExternalBrowserLauncher.open(this@MainActivity, uri)
-                    closeChild()
-                    return true
-                }
-
-                child.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(
-                        view: WebView?, request: WebResourceRequest?
-                    ): Boolean {
-                        if (request?.isForMainFrame == true && routePopup(request.url.toString())) {
-                            return true
-                        }
-                        return false
-                    }
-
-                    override fun onPageStarted(
-                        view: WebView?, url: String?, favicon: android.graphics.Bitmap?
-                    ) {
-                        if (!handedOff) routePopup(url)
-                    }
-                }
-                // Discard abandoned/about:blank windows without retaining extra renderers.
-                mainHandler.postDelayed({ if (!handedOff) closeChild() }, 10_000L)
-                transport.webView = child
-                resultMsg.sendToTarget()
-                return true
-            }
-
-            override fun onConsoleMessage(message: android.webkit.ConsoleMessage): Boolean {
-                if (diagnosticsEnabled && message.message().startsWith("[kiTavern-heartbeat]")) {
-                    Log.w("KiTavernDiagnostics", message.message())
-                    return true
-                }
-                return super.onConsoleMessage(message)
-            }
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                super.onProgressChanged(view, newProgress)
-                // onPageFinished can run before WebView reaches 100% progress.
-                // Start recovery probes once both signals say the page is idle.
-                if (newProgress == 100 && noPageAssetPageFinished && !mainFrameLoading) {
-                    updateNoPagePinger()
-                }
-            }
-
-            override fun onShowFileChooser(
-                webView: WebView?,
-                filePathCallback: ValueCallback<Array<Uri>>?,
-                fileChooserParams: FileChooserParams?
-            ): Boolean {
-                this@MainActivity.filePathCallback?.onReceiveValue(null)
-                this@MainActivity.filePathCallback = filePathCallback
-
-                val chooserIntent = try {
-                    fileChooserParams?.createIntent()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Unable to create file chooser intent", e)
-                    null
-                }
-
-                if (chooserIntent == null) {
-                    this@MainActivity.filePathCallback?.onReceiveValue(null)
-                    this@MainActivity.filePathCallback = null
-                    return false
-                }
-
-                // WebView may convert accept=".json, .jsonl" into only application/json.
-                // Many Android document providers do not assign a JSON MIME type to .jsonl,
-                // so the picker hides valid chat exports. Only relax this particular
-                // chooser request; keep all other upload filters and chooser extras intact.
-                val acceptsJsonl = fileChooserParams?.acceptTypes?.any { accept ->
-                    accept.split(',', ';', ' ', '\t', '\r', '\n')
-                        .any { it.equals(".jsonl", ignoreCase = true) }
-                } == true
-                if (acceptsJsonl) {
-                    chooserIntent.type = "*/*"
-                    // A stale JSON-only MIME allowlist would override the wildcard on
-                    // document providers that honour EXTRA_MIME_TYPES.
-                    chooserIntent.removeExtra(Intent.EXTRA_MIME_TYPES)
-                }
-
-                return try {
-                    startActivityForResult(chooserIntent, fileChooserResultCode)
-                    true
-                } catch (e: Exception) {
-                    Log.e(TAG, "Unable to open file chooser", e)
-                    this@MainActivity.filePathCallback?.onReceiveValue(null)
-                    this@MainActivity.filePathCallback = null
-                    false
-                }
-            }
-
-            override fun onPermissionRequest(request: PermissionRequest?) {
-                if (request == null) return
-                runOnUiThread {
-                    // Grant media only to the currently displayed top-level origin,
-                    // not arbitrary embedded third-party frames.
-                    if (!isCurrentPageOrigin(request.origin)) {
-                        request.deny()
-                        return@runOnUiThread
-                    }
-                    pendingWebPermission?.deny()
-                    pendingWebPermission = request
-                    val missing = requiredAndroidMediaPermissions(request).filter {
-                        ContextCompat.checkSelfPermission(this@MainActivity, it) !=
-                            PackageManager.PERMISSION_GRANTED
-                    }
-                    if (missing.isEmpty()) completePendingWebPermission()
-                    else requestPermissionLauncher.launch(missing.toTypedArray())
-                }
-            }
-
-            override fun onPermissionRequestCanceled(request: PermissionRequest?) {
-                if (request != null && pendingWebPermission === request) {
-                    pendingWebPermission = null
-                }
-            }
-        }
-
-        // Observe a slow renderer, but NEVER terminate it just because long-running
-        // JavaScript made it temporarily unresponsive.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            view.setWebViewRenderProcessClient(object : WebViewRenderProcessClient() {
-                override fun onRenderProcessUnresponsive(
-                    view: WebView, renderer: WebViewRenderProcess?
-                ) {
-                    Log.w(TAG, "WebView renderer unresponsive (work may still be running)")
-                }
-
-                override fun onRenderProcessResponsive(
-                    view: WebView, renderer: WebViewRenderProcess?
-                ) {
-                    Log.i(TAG, "WebView renderer responsive again")
-                }
-            })
-        }
-
-        view.setDownloadListener(DownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
-            if (downloadUrl.startsWith("blob:")) return@DownloadListener
-            if (downloadUrl.startsWith("data:")) {
-                handleDataUrlDownload(downloadUrl)
-                return@DownloadListener
-            }
-
-            val downloadUri = try {
-                Uri.parse(downloadUrl)
-            } catch (_: Exception) {
-                return@DownloadListener
-            }
-            if (downloadUri.scheme !in setOf("http", "https")) return@DownloadListener
-
-            try {
-                val fileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
-                val request = DownloadManager.Request(downloadUri).apply {
-                    setMimeType(mimeType)
-                    CookieManager.getInstance().getCookie(downloadUrl)
-                        ?.takeIf { it.isNotBlank() }
-                        ?.let { addRequestHeader("cookie", it) }
-                    addRequestHeader("User-Agent", userAgent)
-                    setDescription("Downloading...")
-                    setTitle(fileName)
-                    allowScanningByMediaScanner()
-                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
-                }
-                val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                downloadManager.enqueue(request)
-                Toast.makeText(applicationContext, "Downloading file...", Toast.LENGTH_LONG).show()
-            } catch (e: Exception) {
-                Log.e(TAG, "Download could not be queued", e)
-                Toast.makeText(applicationContext, "Unable to start download", Toast.LENGTH_LONG).show()
-            }
-        })
-
-        return view
-    }
-
-    private fun recoverWebViewAfterRendererExit(deadWebView: WebView) {
-        findOnPageBar?.dismiss()
-        selectionAutoScroller?.close()
-        selectionAutoScroller = null
-        noPageAssetPageFinished = false
-        mainFrameLoading = false
-        recoveryNavigationPending = false
-        invalidateKeyboardLift()
-        val urlToRestore = deadWebView.url
-            ?.takeIf { UrlValidator.isValid(it) || isNoPageAssetUrl(it) }
-            ?: KioskPrefs.getUrl(this)
-
-        (deadWebView.parent as? ViewGroup)?.removeView(deadWebView)
-        // A terminated renderer cannot finish its active Blob transfers.
-        retainedDownloadBridge?.cancelAllDownloads()
-        try {
-            deadWebView.destroy()
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not destroy crashed WebView", e)
-        }
-
-        if (!::container.isInitialized || isFinishing || isDestroyed) return
-        webView = createConfiguredWebView()
-        selectionAutoScroller = SillyTavernSelectionAutoScroller(webView)
-        container.addView(
-            webView,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
-        )
-        // This reload is intentional: the previous renderer is dead and cannot retain live JS state.
-        webView.loadUrl(urlToRestore)
-        updateNoPagePinger()
-    }
-
-    private fun handleBlobDownload(targetView: WebView?, blobUrl: String) {
-        val quotedUrl = JSONObject.quote(blobUrl)
-        targetView?.evaluateJavascript(
+        private val FOCUS_POLICY_TEMPLATE: String by lazy(LazyThreadSafetyMode.NONE) {
             """
             (function() {
-                var blob = window.__blobRegistry && window.__blobRegistry[$quotedUrl];
-                function saveBlob(b) {
-                    if (window.__kiTavernSaveBlob) window.__kiTavernSaveBlob(b, 'download');
-                }
-                if (blob) saveBlob(blob);
-                else fetch($quotedUrl).then(function(r) { return r.blob(); })
-                    .then(saveBlob).catch(function(e) { console.warn('Blob fetch failed', e); });
-            })();
-            """.trimIndent(), null
-        )
-    }
-
-    private fun handleDataUrlDownload(dataUrl: String) {
-        val commaIndex = dataUrl.indexOf(',')
-        if (commaIndex <= 0) return
-        try {
-            // Keep filename/MIME resolution on the UI thread; move payload decoding
-            // and MediaStore writes off it without capturing this Activity.
-            val header = dataUrl.substring(0, commaIndex).removePrefix("data:")
-            val mimeType = header.substringBefore(';').ifBlank { "text/plain" }
-            val filename = "download" + mimeToExtension(mimeType)
-            val isBase64 = header.split(';').any { it.equals("base64", ignoreCase = true) }
-            val downloader = blobDownloader
-            downloader.enqueueDataUrlTask {
-                try {
-                    val payload = dataUrl.substring(commaIndex + 1)
-                    if (isBase64) {
-                        downloader.downloadBase64(payload, mimeType, filename)
-                    } else {
-                        downloader.downloadText(Uri.decode(payload), mimeType, filename)
+                var state = window.__kiTavernFocusPolicy;
+                if (!state) {
+                    state = {autoFocus: true, allowedUntil: 0};
+                    window.__kiTavernFocusPolicy = state;
+                    function isComposer(el) {
+                        return el && el.nodeType === 1 &&
+                            (el.id === 'send_textarea' ||
+                             (el.closest && el.closest('#send_textarea')));
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Could not process data URL download", e)
-                    downloader.showDataUrlFailure()
+                    // Only an actual interaction with the composer opts in to
+                    // keyboard focus. Clicking a message/chat elsewhere doesn't.
+                    function allowUserFocus(e) {
+                        if (isComposer(e.target))
+                            state.allowedUntil = performance.now() + 1600;
+                    }
+                    document.addEventListener('pointerdown', allowUserFocus, true);
+                    document.addEventListener('touchstart', allowUserFocus, true);
+                    document.addEventListener('mousedown', allowUserFocus, true);
+                    document.addEventListener('focusin', function(e) {
+                        if (!state.autoFocus && isComposer(e.target) &&
+                            performance.now() > state.allowedUntil) {
+                            e.target.blur();
+                        }
+                    }, true);
                 }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Could not process data URL download", e)
-            Toast.makeText(this, "Download failed", Toast.LENGTH_SHORT).show()
+                state.autoFocus = __AUTO_FOCUS__;
+                if (!state.autoFocus && document.activeElement &&
+                    (document.activeElement.id === 'send_textarea' ||
+                     (document.activeElement.closest &&
+                      document.activeElement.closest('#send_textarea'))) &&
+                    performance.now() > state.allowedUntil) {
+                    document.activeElement.blur();
+                }
+            })();
+            """.trimIndent()
         }
-    }
 
-    private fun injectBlobInterceptor(targetView: WebView) {
-        val js = """
+        private val FOCUS_POLICY_SCRIPT_AUTO_FOCUS_ON: String by lazy(LazyThreadSafetyMode.NONE) {
+            FOCUS_POLICY_TEMPLATE.replace(FOCUS_POLICY_PLACEHOLDER, "true")
+        }
+        private val FOCUS_POLICY_SCRIPT_AUTO_FOCUS_OFF: String by lazy(LazyThreadSafetyMode.NONE) {
+            FOCUS_POLICY_TEMPLATE.replace(FOCUS_POLICY_PLACEHOLDER, "false")
+        }
+
+        private val BLOB_INTERCEPTOR_SCRIPT: String by lazy(LazyThreadSafetyMode.NONE) {
+            """
             (function() {
                 if (window.__blobInterceptorInstalled) return;
                 window.__blobInterceptorInstalled = true;
@@ -1272,14 +435,10 @@ class MainActivity : AppCompatActivity() {
                     return click.call(this);
                 };
             })();
-        """.trimIndent()
-        targetView.evaluateJavascript(js, null)
-    }
+            """.trimIndent()
+        }
 
-    /** Let scrollbar drags continue horizontally away from the scrollbar's narrow track. */
-    private fun installScrollbarDrag(target: WebView) {
-        if (!UrlValidator.isValid(target.url)) return
-        target.evaluateJavascript(
+        private val SCROLLBAR_DRAG_SCRIPT: String by lazy(LazyThreadSafetyMode.NONE) {
             """
             (function() {
                 if (window.__kiTavernScrollbarDragInstalled) return;
@@ -1671,8 +830,881 @@ class MainActivity : AppCompatActivity() {
                 window.addEventListener('pagehide', function() { endDrag(true); });
                 window.addEventListener('blur', function() { endDrag(true); });
             })();
+            """.trimIndent()
+        }
+    }
+
+    private val requestPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        results.forEach { (permission, granted) ->
+            Log.d("Permissions", "$permission: ${if (granted) "granted" else "denied"}")
+        }
+        completePendingWebPermission()
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        applyTheme()
+        super.onCreate(savedInstanceState)
+        requestPermissionsIfNeeded()
+
+        configureKeyboardInsets()
+        container = FrameLayout(this)
+        container.setBackgroundColor(BACKGROUND_COLOR)
+        setContentView(container)
+        installKeyboardInsetsListener()
+        // Window panning can move the WebView without changing IME inset height.
+        // Observe the Activity container (not the retained WebView) for those moves.
+        container.viewTreeObserver.addOnGlobalLayoutListener(keyboardLayoutListener)
+
+        // A restored settings overlay must be rebound to this Activity instance.
+        settingsFragment = supportFragmentManager.findFragmentByTag(SETTINGS_TAG) as? SettingsFragment
+        settingsFragment?.let(::bindSettingsCallbacks)
+
+        noPagePinger = NoPagePinger(
+            targetUrlProvider = { currentNoPageRetryUrl() },
+            shouldPing = { shouldPingNoPageTarget() },
+            onSuccessfulPing = { target -> recoverFromNoPageIfIdle(target) }
+        )
+
+        setupWebView(savedInstanceState)
+
+        // Start independently of the Activity lifecycle. Never stop the service in onDestroy().
+        if (KioskPrefs.getKeepAlive(this)) {
+            KeepAliveService.start(this)
+        }
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (findOnPageBar?.dismiss() == true) return
+                if (settingsFragment != null) closeSettings() else showSettings()
+            }
+        })
+    }
+
+    private fun applyTheme() {
+        val theme = KioskPrefs.getTheme(this)
+        setTheme(if (theme == "light") R.style.Theme_KioskViewer_Light else R.style.Theme_KioskViewer)
+    }
+
+    /**
+     * Trial of the Stack Overflow adjustPan + page-side keyboard positioning.
+     * Do not combine it with the old native IME padding/adjustResize behaviour.
+     * We retain edge-to-edge for the existing native Settings presentation.
+     */
+    private fun configureKeyboardInsets() {
+        @Suppress("DEPRECATION")
+        updateKeyboardStartupMode()
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+    }
+
+    /** Keep Android's initial IME state hidden when chat auto-focus is disabled. */
+    private fun updateKeyboardStartupMode() {
+        val state = if (KioskPrefs.getAutoFocusChatInput(this)) 0 else
+            WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN
+        @Suppress("DEPRECATION")
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or state)
+    }
+
+    /** SillyTavern focuses #send_textarea programmatically on chat changes.
+     *  Ignore that automatic focus only when the setting is off; explicit taps
+     *  on the composer still focus it normally. Other websites are untouched.
+     */
+    private fun updateChatFocusPolicy(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        target.evaluateJavascript(
+            if (KioskPrefs.getAutoFocusChatInput(this)) FOCUS_POLICY_SCRIPT_AUTO_FOCUS_ON
+            else FOCUS_POLICY_SCRIPT_AUTO_FOCUS_OFF,
+            null
+        )
+    }
+
+    private fun installKeyboardInsetsListener() {
+        val root = findViewById<FrameLayout>(android.R.id.content)
+        val barsAndCutout = WindowInsetsCompat.Type.systemBars() or
+            WindowInsetsCompat.Type.displayCutout()
+        val handledTypes = barsAndCutout or WindowInsetsCompat.Type.ime()
+
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val bars = insets.getInsets(barsAndCutout)
+            // Keep only system-bar padding for both WebView and the native overlay.
+            // IME padding here would shrink WebView and double-count the JS adjustment.
+            if (view.paddingLeft != bars.left || view.paddingTop != bars.top ||
+                view.paddingRight != bars.right || view.paddingBottom != bars.bottom
+            ) {
+                view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            }
+
+            val visible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            val bottom = if (visible) insets.getInsets(WindowInsetsCompat.Type.ime()).bottom else 0
+            if (keyboardIsVisible != visible || keyboardInsetBottomPx != bottom) {
+                keyboardIsVisible = visible
+                keyboardInsetBottomPx = bottom
+                scheduleKeyboardLiftUpdate()
+            }
+
+            // We handle IME occlusion in JavaScript. Tell WebView that this inset
+            // has been handled, avoiding modern WebView's second viewport resize.
+            WindowInsetsCompat.Builder(insets)
+                .setInsets(handledTypes, Insets.NONE)
+                .setVisible(WindowInsetsCompat.Type.ime(), false)
+                .build()
+        }
+        ViewCompat.requestApplyInsets(root)
+    }
+
+    private fun scheduleKeyboardLiftUpdate() {
+        if (!::container.isInitialized) return
+        // Coalesce IME and layout callbacks into at most one update per frame.
+        if (!keyboardLiftUpdateScheduled) {
+            keyboardLiftUpdateScheduled = true
+            container.postOnAnimation(keyboardLiftUpdate)
+        }
+    }
+
+    /** In screen coordinates so adjustPan's own window movement is not counted twice. */
+    private fun getWindowScreenBottomPx(): Int {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return windowManager.currentWindowMetrics.bounds.bottom
+        }
+        val size = Point()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealSize(size)
+        return size.y
+    }
+
+    private fun pushKeyboardLiftToWebView() {
+        if (!::webView.isInitialized || !webView.isAttachedToWindow ||
+            !UrlValidator.isValid(webView.url) || webView.height <= 0
+        ) return
+
+        // Calculate only the part of the *currently positioned* WebView actually
+        // hidden by the keyboard. This avoids blindly moving the bar by the full
+        // IME height if Android has already panned the window upward.
+        val location = liftLocation
+        webView.getLocationOnScreen(location)
+        val obscuredPx = if (keyboardIsVisible && settingsFragment == null) {
+            val keyboardTop = getWindowScreenBottomPx() - keyboardInsetBottomPx
+            (location[1] + webView.height - keyboardTop).coerceIn(0, webView.height)
+        } else {
+            0
+        }
+        // Avoid invoking JavaScript for every unrelated global layout pass.
+        if (lastLiftTarget === webView && lastLiftOcclusion == obscuredPx &&
+            lastLiftHeight == webView.height
+        ) return
+        lastLiftTarget = webView
+        lastLiftOcclusion = obscuredPx
+        lastLiftHeight = webView.height
+        webView.evaluateJavascript(
+            "window.__kiTavernKeyboardLift && " +
+                "window.__kiTavernKeyboardLift.setOcclusion($obscuredPx, ${webView.height});",
+            null
+        )
+    }
+
+    private fun invalidateKeyboardLift() {
+        lastLiftTarget = null
+        lastLiftOcclusion = Int.MIN_VALUE
+        lastLiftHeight = Int.MIN_VALUE
+    }
+
+    /** Injected only into normal HTTP(S) pages; nopage.html needs no keyboard code. */
+    private fun installKeyboardLift(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        target.evaluateJavascript(KEYBOARD_LIFT_SCRIPT) { _ ->
+            if (::webView.isInitialized && webView === target) scheduleKeyboardLiftUpdate()
+        }
+    }
+
+    /** Applies runtime preferences without navigating/reloading the WebView. */
+    private fun applyRuntimeSettings() {
+        val wantedOrientation = when (KioskPrefs.getOrientation(this)) {
+            "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            "portrait" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+        if (requestedOrientation != wantedOrientation) requestedOrientation = wantedOrientation
+
+        updateKeyboardStartupMode()
+        if (::webView.isInitialized) updateChatFocusPolicy(webView)
+
+        if (KioskPrefs.getScreenOn(this)) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    private fun isCurrentPageOrigin(origin: Uri): Boolean {
+        if (!::webView.isInitialized) return false
+        val page = Uri.parse(webView.url ?: return false)
+        val firstScheme = page.scheme?.lowercase() ?: return false
+        if (firstScheme != "http" && firstScheme != "https") return false
+        if (!firstScheme.equals(origin.scheme, ignoreCase = true) ||
+            !page.host.equals(origin.host, ignoreCase = true)
+        ) return false
+        fun effectivePort(uri: Uri): Int = when {
+            uri.port >= 0 -> uri.port
+            uri.scheme.equals("https", ignoreCase = true) -> 443
+            else -> 80
+        }
+        return effectivePort(page) == effectivePort(origin)
+    }
+
+    private fun requiredAndroidMediaPermissions(request: PermissionRequest): List<String> =
+        request.resources.mapNotNull { resource ->
+            when (resource) {
+                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
+                else -> null
+            }
+        }.distinct()
+
+    private fun completePendingWebPermission() {
+        val request = pendingWebPermission ?: return
+        pendingWebPermission = null
+        if (!isCurrentPageOrigin(request.origin)) {
+            request.deny()
+            return
+        }
+        val allowed = request.resources.filter { resource ->
+            val permission = when (resource) {
+                PermissionRequest.RESOURCE_VIDEO_CAPTURE -> Manifest.permission.CAMERA
+                PermissionRequest.RESOURCE_AUDIO_CAPTURE -> Manifest.permission.RECORD_AUDIO
+                else -> null
+            }
+            permission != null && ContextCompat.checkSelfPermission(this, permission) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+        if (allowed.isEmpty()) request.deny() else request.grant(allowed.toTypedArray())
+    }
+
+    private fun requestPermissionsIfNeeded() {
+        val permissions = mutableListOf<String>()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            permissions += Manifest.permission.POST_NOTIFICATIONS
+        }
+        // Request camera/microphone only if a webpage actually asks for them.
+        // This avoids prompts and system work on an ordinary kiosk launch.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            permissions += Manifest.permission.WRITE_EXTERNAL_STORAGE
+        }
+
+        if (permissions.isNotEmpty()) requestPermissionLauncher.launch(permissions.toTypedArray())
+    }
+
+    private fun setupWebView(savedInstanceState: Bundle?) {
+        applyRuntimeSettings()
+        val forceReload = intent?.getBooleanExtra(EXTRA_RELOAD, false) == true
+        val retained = lastCustomNonConfigurationInstance as? RetainedBrowser
+        retainedDownloadBridge = retained?.downloads
+        val retainedWebView = retained?.view
+        webView = createConfiguredWebView(retainedWebView)
+        // Use the same JS bridge and touch-handle listeners after a retained WebView
+        // moves to a recreated Activity. Do not install duplicate listeners.
+        selectionAutoScroller = retained?.selectionAutoScroller
+            ?: SillyTavernSelectionAutoScroller(webView)
+        container.addView(
+            webView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        // A retained/restored WebView may never fire onPageFinished again.
+        webView.post {
+            installKeyboardLift(webView)
+            updateChatFocusPolicy(webView)
+            installScrollbarDrag(webView)
+            installNativeSelectionBoundaries(webView)
+        }
+
+        // If this is a configuration/recreation hand-off, keep the same WebView object
+        // and its live DOM/JS heap. An explicit EXTRA_RELOAD still overrides retention.
+        if (retainedWebView != null) {
+            mainFrameLoading = retainedWebView.progress < 100
+            noPageAssetPageFinished = !forceReload && !mainFrameLoading &&
+                isNoPageAssetUrl(retainedWebView.url)
+            if (forceReload) webView.loadUrl(KioskPrefs.getUrl(this))
+            intent?.removeExtra(EXTRA_RELOAD)
+            updateNoPagePinger()
+            return
+        }
+
+        val previousWebViewState = savedInstanceState?.getBundle(STATE_WEBVIEW)
+        val restoredHistory = if (!forceReload && previousWebViewState != null) {
+            try {
+                webView.restoreState(previousWebViewState)
+            } catch (e: Exception) {
+                Log.w(TAG, "WebView navigation state could not be restored", e)
+                null
+            }
+        } else {
+            null
+        }
+
+        when {
+            forceReload -> webView.loadUrl(KioskPrefs.getUrl(this))
+            restoredHistory == null || webView.url.isNullOrBlank() -> {
+                val savedUrl = savedInstanceState?.getString(STATE_LAST_URL)
+                    ?.takeIf { UrlValidator.isValid(it) || isNoPageAssetUrl(it) }
+                // Only navigate if WebView state restoration failed. Normal Activity
+                // resume/return-to-app paths never reload the current SillyTavern page.
+                webView.loadUrl(savedUrl ?: KioskPrefs.getUrl(this))
+            }
+            else -> Log.d(TAG, "Restored WebView back/forward state at ${webView.url}")
+        }
+
+        // Restoring history may not produce another onPageFinished() callback.
+        // Resume checking if the local fallback is already fully displayed.
+        if (!forceReload && restoredHistory != null &&
+            isNoPageAssetUrl(webView.url) && webView.progress >= 100
+        ) {
+            mainFrameLoading = false
+            noPageAssetPageFinished = true
+        }
+
+        // Do not let a one-shot explicit reload extra cause another reload on recreation.
+        intent?.removeExtra(EXTRA_RELOAD)
+        updateNoPagePinger()
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createConfiguredWebView(existing: WebView? = null): WebView {
+        // A mutable context prevents our explicitly retained WebView from pinning an
+        // obsolete Activity after configuration/theme recreation.
+        val view = existing ?: FindOnPageWebView(MutableContextWrapper(this))
+        (view.context as? MutableContextWrapper)?.baseContext = this
+        // Rebind after Activity recreation: the retained WebView must not keep
+        // a callback referencing the previous Activity instance.
+        (view as? FindOnPageWebView)?.onFindOnPageRequested = { selectedText ->
+            if (!isFinishing && !isDestroyed) {
+                val findBar = findOnPageBar ?: FindOnPageBar(this).also { findOnPageBar = it }
+                findBar.show(view, selectedText)
+            }
+        }
+        view.setBackgroundColor(BACKGROUND_COLOR)
+        // Disable Android's overscroll edge glow; the thumb highlight is CSS-only.
+        view.overScrollMode = android.view.View.OVER_SCROLL_NEVER
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Keep the renderer at important priority even when this WebView is not visible.
+            // This reduces (but cannot eliminate) renderer process reclamation.
+            view.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+        }
+
+        view.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            builtInZoomControls = true
+            displayZoomControls = false
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            cacheMode = WebSettings.LOAD_DEFAULT
+            mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            allowFileAccess = true
+            allowContentAccess = true
+            mediaPlaybackRequiresUserGesture = false
+            // Handle target=_blank and user-initiated window.open links externally.
+            setSupportMultipleWindows(true)
+            javaScriptCanOpenWindowsAutomatically = false
+        }
+
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
+        if (existing == null) {
+            view.addJavascriptInterface(blobDownloader, "BlobDownloader")
+        }
+        // Reuse the bridge with retained WebViews (rotation does not re-inject
+        // JavaScript interfaces into an already-loaded page).
+        val scrollbarBridge = (view.tag as? ScrollbarTouchBridge)
+            ?: ScrollbarTouchBridge().also {
+                view.tag = it
+                view.addJavascriptInterface(it, "KiTavernScrollbarTouch")
+            }
+
+        // Keep Chromium's built-in text selection and native Android handles.
+        // Only the existing dedicated scrollbar-thumb gesture is intercepted;
+        // every other touch/long press goes directly to WebView.
+        var nativeScrollbarTouch = false
+        var nativeScrollbarPointerId = -1
+        var nativeScrollbarY = 0f
+        var nativeScrollbarScope = ""
+        var nativeScrollbarFrameQueued = false
+        // Keep no more than one move pending on the UI thread. Renderer messages
+        // for 120Hz touch screens must not accumulate faster than paint frames.
+        val nativeScrollbarMoveFrame = object : Runnable {
+            override fun run() {
+                nativeScrollbarFrameQueued = false
+                if (nativeScrollbarTouch) {
+                    view.evaluateJavascript(
+                        "window.__kiTavernScrollbarNative && " +
+                            "window.__kiTavernScrollbarNative.move($nativeScrollbarY);", null
+                    )
+                }
+            }
+        }
+        fun nativeScrollbarEnd(cancel: Boolean) {
+            if (!nativeScrollbarTouch) return
+            nativeScrollbarTouch = false
+            nativeScrollbarPointerId = -1
+            nativeScrollbarFrameQueued = false
+            view.removeCallbacks(nativeScrollbarMoveFrame)
+            view.evaluateJavascript(
+                "window.__kiTavernScrollbarNative && " +
+                    "window.__kiTavernScrollbarNative.end(${if (cancel) "true" else "false"},$nativeScrollbarY);",
+                null
+            )
+        }
+        fun thumbPress(event: MotionEvent): ScrollbarTouchBridge.Bounds? {
+            val bounds = scrollbarBridge.bounds ?: return null
+            val viewWidth = view.width
+            val viewHeight = view.height
+            if (viewWidth <= 0 || viewHeight <= 0) return null
+            val x = event.x * bounds.viewportWidth / viewWidth
+            val y = event.y * bounds.viewportHeight / viewHeight
+            // The URL check is the costly part, so it goes last (it only matters on a hit).
+            return if (x >= bounds.right - 32f && x <= bounds.right + 3f &&
+                y >= bounds.top && y <= bounds.bottom &&
+                UrlValidator.isValid(view.url)
+            ) bounds else null
+        }
+        view.setOnTouchListener { _, event ->
+            // Intercept at the Android View boundary *before* Chromium can claim
+            // the native scrollbar drag on the compositor. Otherwise it may
+            // move without our blue pressed state and race the JS scroll guard.
+            if (nativeScrollbarTouch) {
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_MOVE -> {
+                        if (event.pointerCount != 1 ||
+                            event.getPointerId(0) != nativeScrollbarPointerId) {
+                            nativeScrollbarEnd(true)
+                        } else {
+                            val geometry = scrollbarBridge.bounds
+                            if (geometry != null) {
+                                nativeScrollbarY = event.y * geometry.viewportHeight / view.height
+                                if (!nativeScrollbarFrameQueued) {
+                                    nativeScrollbarFrameQueued = true
+                                    view.postOnAnimation(nativeScrollbarMoveFrame)
+                                }
+                            }
+                        }
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        val geometry = scrollbarBridge.bounds
+                        if (geometry != null && view.height > 0)
+                            nativeScrollbarY = event.y * geometry.viewportHeight / view.height
+                        nativeScrollbarEnd(false)
+                    }
+                    MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> nativeScrollbarEnd(true)
+                }
+                return@setOnTouchListener true
+            }
+            if (event.actionMasked == MotionEvent.ACTION_DOWN && event.pointerCount == 1) {
+                val hit = thumbPress(event)
+                if (hit != null) {
+                    nativeScrollbarTouch = true
+                    nativeScrollbarPointerId = event.getPointerId(0)
+                    nativeScrollbarScope = hit.scope
+                    nativeScrollbarY = event.y * hit.viewportHeight / view.height
+                    val x = event.x * hit.viewportWidth / view.width
+                    // Zero velocity cancels an in-flight WebView fling at the
+                    // Android boundary, before the dedicated drag takes control.
+                    view.flingScroll(0, 0)
+                    view.evaluateJavascript(
+                        "window.__kiTavernScrollbarNative && " +
+                            "window.__kiTavernScrollbarNative.down($x,$nativeScrollbarY,'$nativeScrollbarScope');",
+                        null
+                    )
+                    return@setOnTouchListener true
+                }
+            }
+            false // Let WebView/Chromium own native selection, editing and scrolling.
+        }
+
+        view.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val navigation = request ?: return false
+                val requestedUrl = navigation.url.toString()
+
+                if (requestedUrl.startsWith("blob:")) {
+                    handleBlobDownload(view, requestedUrl)
+                    return true
+                }
+
+                if (requestedUrl.startsWith("data:")) {
+                    handleDataUrlDownload(requestedUrl)
+                    return true
+                }
+
+                // Internal SillyTavern links stay in this WebView. Web links to other
+                // origins leave the app; never replace the active chat with a web page.
+                if (navigation.isForMainFrame && ExternalBrowserLauncher.isExternalWebLink(
+                        this@MainActivity, navigation.url
+                    )) {
+                    ExternalBrowserLauncher.open(this@MainActivity, navigation.url)
+                    return true
+                }
+
+                return false
+            }
+
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                findOnPageBar?.dismiss()
+                selectionAutoScroller?.onNavigationStarted()
+                scrollbarBridge.bounds = null
+                super.onPageStarted(view, url, favicon)
+                invalidateKeyboardLift()
+                // Only ping when the local fallback has fully loaded and is idle.
+                mainFrameLoading = true
+                recoveryNavigationPending = false
+                noPageAssetPageFinished = false
+                updateNoPagePinger()
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                if (view != null) {
+                    injectBlobInterceptor(view)
+                    installKeyboardLift(view)
+                    updateChatFocusPolicy(view)
+                    installScrollbarDrag(view)
+                    installNativeSelectionBoundaries(view)
+                    installDebugHeartbeat(view)
+                }
+                mainFrameLoading = false
+                recoveryNavigationPending = false
+                noPageAssetPageFinished = isNoPageAssetUrl(url ?: view?.url)
+                updateNoPagePinger()
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                // Subresource failures must not replace the entire page with nopage.html.
+                if (request?.isForMainFrame != true) return
+
+                val failedUrl = request.url.toString()
+                val encodedUrl = URLEncoder.encode(failedUrl, Charsets.UTF_8.name())
+                view?.loadUrl("$NO_PAGE_ASSET_URL?url=$encodedUrl")
+            }
+
+            override fun onRenderProcessGone(
+                view: WebView,
+                detail: RenderProcessGoneDetail
+            ): Boolean {
+                Log.e(TAG, "WebView renderer exited; didCrash=${detail.didCrash()}")
+                recoverWebViewAfterRendererExit(view)
+                // Returning true says that this Activity handled the dead WebView.
+                return true
+            }
+        }
+
+        view.webChromeClient = object : WebChromeClient() {
+            override fun onCreateWindow(
+                view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?
+            ): Boolean {
+                // Accept only user-triggered popups. SillyTavern's own page stays put.
+                if (!isUserGesture || resultMsg == null) return false
+                val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+                val child = WebView(this@MainActivity)
+                var handedOff = false
+                val mainHandler = Handler(Looper.getMainLooper())
+
+                fun closeChild() {
+                    mainHandler.post {
+                        try {
+                            child.stopLoading()
+                            child.webViewClient = WebViewClient()
+                            child.destroy()
+                        } catch (_: Exception) { }
+                    }
+                }
+
+                fun routePopup(address: String?): Boolean {
+                    if (handedOff || address.isNullOrBlank() || address == "about:blank") return false
+                    val uri = try { Uri.parse(address) } catch (_: Exception) { return false }
+                    val scheme = uri.scheme
+                    if (scheme != "http" && scheme != "https") return false
+                    handedOff = true
+                    ExternalBrowserLauncher.open(this@MainActivity, uri)
+                    closeChild()
+                    return true
+                }
+
+                child.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        view: WebView?, request: WebResourceRequest?
+                    ): Boolean {
+                        if (request?.isForMainFrame == true && routePopup(request.url.toString())) {
+                            return true
+                        }
+                        return false
+                    }
+
+                    override fun onPageStarted(
+                        view: WebView?, url: String?, favicon: android.graphics.Bitmap?
+                    ) {
+                        if (!handedOff) routePopup(url)
+                    }
+                }
+                // Discard abandoned/about:blank windows without retaining extra renderers.
+                mainHandler.postDelayed({ if (!handedOff) closeChild() }, 10_000L)
+                transport.webView = child
+                resultMsg.sendToTarget()
+                return true
+            }
+
+            override fun onConsoleMessage(message: android.webkit.ConsoleMessage): Boolean {
+                if (diagnosticsEnabled && message.message().startsWith("[kiTavern-heartbeat]")) {
+                    Log.w("KiTavernDiagnostics", message.message())
+                    return true
+                }
+                return super.onConsoleMessage(message)
+            }
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                // onPageFinished can run before WebView reaches 100% progress.
+                // Start recovery probes once both signals say the page is idle.
+                if (newProgress == 100 && noPageAssetPageFinished && !mainFrameLoading) {
+                    updateNoPagePinger()
+                }
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                this@MainActivity.filePathCallback?.onReceiveValue(null)
+                this@MainActivity.filePathCallback = filePathCallback
+
+                val chooserIntent = try {
+                    fileChooserParams?.createIntent()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Unable to create file chooser intent", e)
+                    null
+                }
+
+                if (chooserIntent == null) {
+                    this@MainActivity.filePathCallback?.onReceiveValue(null)
+                    this@MainActivity.filePathCallback = null
+                    return false
+                }
+
+                // WebView may convert accept=".json, .jsonl" into only application/json.
+                // Many Android document providers do not assign a JSON MIME type to .jsonl,
+                // so the picker hides valid chat exports. Only relax this particular
+                // chooser request; keep all other upload filters and chooser extras intact.
+                val acceptsJsonl = fileChooserParams?.acceptTypes?.any { accept ->
+                    accept.split(',', ';', ' ', '\t', '\r', '\n')
+                        .any { it.equals(".jsonl", ignoreCase = true) }
+                } == true
+                if (acceptsJsonl) {
+                    chooserIntent.type = "*/*"
+                    // A stale JSON-only MIME allowlist would override the wildcard on
+                    // document providers that honour EXTRA_MIME_TYPES.
+                    chooserIntent.removeExtra(Intent.EXTRA_MIME_TYPES)
+                }
+
+                return try {
+                    startActivityForResult(chooserIntent, FILE_CHOOSER_RESULT_CODE)
+                    true
+                } catch (e: Exception) {
+                    Log.e(TAG, "Unable to open file chooser", e)
+                    this@MainActivity.filePathCallback?.onReceiveValue(null)
+                    this@MainActivity.filePathCallback = null
+                    false
+                }
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                if (request == null) return
+                runOnUiThread {
+                    // Grant media only to the currently displayed top-level origin,
+                    // not arbitrary embedded third-party frames.
+                    if (!isCurrentPageOrigin(request.origin)) {
+                        request.deny()
+                        return@runOnUiThread
+                    }
+                    pendingWebPermission?.deny()
+                    pendingWebPermission = request
+                    val missing = requiredAndroidMediaPermissions(request).filter {
+                        ContextCompat.checkSelfPermission(this@MainActivity, it) !=
+                            PackageManager.PERMISSION_GRANTED
+                    }
+                    if (missing.isEmpty()) completePendingWebPermission()
+                    else requestPermissionLauncher.launch(missing.toTypedArray())
+                }
+            }
+
+            override fun onPermissionRequestCanceled(request: PermissionRequest?) {
+                if (request != null && pendingWebPermission === request) {
+                    pendingWebPermission = null
+                }
+            }
+        }
+
+        // Observe a slow renderer, but NEVER terminate it just because long-running
+        // JavaScript made it temporarily unresponsive.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            view.setWebViewRenderProcessClient(object : WebViewRenderProcessClient() {
+                override fun onRenderProcessUnresponsive(
+                    view: WebView, renderer: WebViewRenderProcess?
+                ) {
+                    Log.w(TAG, "WebView renderer unresponsive (work may still be running)")
+                }
+
+                override fun onRenderProcessResponsive(
+                    view: WebView, renderer: WebViewRenderProcess?
+                ) {
+                    Log.i(TAG, "WebView renderer responsive again")
+                }
+            })
+        }
+
+        view.setDownloadListener(DownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, _ ->
+            if (downloadUrl.startsWith("blob:")) return@DownloadListener
+            if (downloadUrl.startsWith("data:")) {
+                handleDataUrlDownload(downloadUrl)
+                return@DownloadListener
+            }
+
+            val downloadUri = try {
+                Uri.parse(downloadUrl)
+            } catch (_: Exception) {
+                return@DownloadListener
+            }
+            val downloadScheme = downloadUri.scheme
+            if (downloadScheme != "http" && downloadScheme != "https") return@DownloadListener
+
+            try {
+                val fileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
+                val request = DownloadManager.Request(downloadUri).apply {
+                    setMimeType(mimeType)
+                    CookieManager.getInstance().getCookie(downloadUrl)
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { addRequestHeader("cookie", it) }
+                    addRequestHeader("User-Agent", userAgent)
+                    setDescription("Downloading...")
+                    setTitle(fileName)
+                    allowScanningByMediaScanner()
+                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                }
+                val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                downloadManager.enqueue(request)
+                Toast.makeText(applicationContext, "Downloading file...", Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Log.e(TAG, "Download could not be queued", e)
+                Toast.makeText(applicationContext, "Unable to start download", Toast.LENGTH_LONG).show()
+            }
+        })
+
+        return view
+    }
+
+    private fun recoverWebViewAfterRendererExit(deadWebView: WebView) {
+        findOnPageBar?.dismiss()
+        selectionAutoScroller?.close()
+        selectionAutoScroller = null
+        noPageAssetPageFinished = false
+        mainFrameLoading = false
+        recoveryNavigationPending = false
+        invalidateKeyboardLift()
+        val urlToRestore = deadWebView.url
+            ?.takeIf { UrlValidator.isValid(it) || isNoPageAssetUrl(it) }
+            ?: KioskPrefs.getUrl(this)
+
+        (deadWebView.parent as? ViewGroup)?.removeView(deadWebView)
+        // A terminated renderer cannot finish its active Blob transfers.
+        retainedDownloadBridge?.cancelAllDownloads()
+        try {
+            deadWebView.destroy()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not destroy crashed WebView", e)
+        }
+
+        if (!::container.isInitialized || isFinishing || isDestroyed) return
+        webView = createConfiguredWebView()
+        selectionAutoScroller = SillyTavernSelectionAutoScroller(webView)
+        container.addView(
+            webView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        // This reload is intentional: the previous renderer is dead and cannot retain live JS state.
+        webView.loadUrl(urlToRestore)
+        updateNoPagePinger()
+    }
+
+    private fun handleBlobDownload(targetView: WebView?, blobUrl: String) {
+        val quotedUrl = JSONObject.quote(blobUrl)
+        targetView?.evaluateJavascript(
+            """
+            (function() {
+                var blob = window.__blobRegistry && window.__blobRegistry[$quotedUrl];
+                function saveBlob(b) {
+                    if (window.__kiTavernSaveBlob) window.__kiTavernSaveBlob(b, 'download');
+                }
+                if (blob) saveBlob(blob);
+                else fetch($quotedUrl).then(function(r) { return r.blob(); })
+                    .then(saveBlob).catch(function(e) { console.warn('Blob fetch failed', e); });
+            })();
             """.trimIndent(), null
         )
+    }
+
+    private fun handleDataUrlDownload(dataUrl: String) {
+        val commaIndex = dataUrl.indexOf(',')
+        if (commaIndex <= 0) return
+        try {
+            // Keep filename/MIME resolution on the UI thread; move payload decoding
+            // and MediaStore writes off it without capturing this Activity.
+            val header = dataUrl.substring(0, commaIndex).removePrefix("data:")
+            val mimeType = header.substringBefore(';').ifBlank { "text/plain" }
+            val filename = "download" + mimeToExtension(mimeType)
+            val isBase64 = header.split(';').any { it.equals("base64", ignoreCase = true) }
+            val downloader = blobDownloader
+            downloader.enqueueDataUrlTask {
+                try {
+                    val payload = dataUrl.substring(commaIndex + 1)
+                    if (isBase64) {
+                        downloader.downloadBase64(payload, mimeType, filename)
+                    } else {
+                        downloader.downloadText(Uri.decode(payload), mimeType, filename)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Could not process data URL download", e)
+                    downloader.showDataUrlFailure()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not process data URL download", e)
+            Toast.makeText(this, "Download failed", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun injectBlobInterceptor(targetView: WebView) {
+        targetView.evaluateJavascript(BLOB_INTERCEPTOR_SCRIPT, null)
+    }
+
+    /** Let scrollbar drags continue horizontally away from the scrollbar's narrow track. */
+    private fun installScrollbarDrag(target: WebView) {
+        if (!UrlValidator.isValid(target.url)) return
+        target.evaluateJavascript(SCROLLBAR_DRAG_SCRIPT, null)
     }
 
     private val nativeSelectionBoundariesScript: String by lazy {
@@ -1845,7 +1877,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == fileChooserResultCode) {
+        if (requestCode == FILE_CHOOSER_RESULT_CODE) {
             val results = if (data == null || resultCode != RESULT_OK) {
                 null
             } else {
