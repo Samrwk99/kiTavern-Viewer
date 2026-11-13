@@ -26,7 +26,10 @@ import kotlin.math.sign
  *
  * The touch handles are separate PopupWindow views; the ordinary WebView
  * OnTouchListener cannot see their drag stream. This class hooks *only* those
- * views, and only changes their coordinates for a selection entirely in #chat.
+ * views, and only changes their coordinates for page text selected inside one
+ * scroll region (#chat, or a settings/drawer panel), confirmed by the page at
+ * the moment the handle is grabbed. Selections inside text fields, and
+ * anything else, stay fully native.
  * Incompatible WebView implementations automatically fall back to native input.
  *
  * SillyTavern files are unchanged. A guarded DOM-anchor recovery runs only
@@ -41,6 +44,9 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         private const val MAX_OVERSHOOT_DP = 96f
         private const val MIN_SPEED_DP_S = 45f
         private const val MAX_SPEED_DP_S = 750f
+        // Settings panels are short and dense: a gentler, constant top speed
+        // with no time-based acceleration.
+        private const val PANEL_MAX_SPEED_DP_S = 360f
         // Only sustained native-handle edge auto-scrolling accelerates.
         // Every 1.5 seconds in one direction adds 40%, up to 4x the usual speed.
         private const val ACCELERATION_INTERVAL_MS = 1_500L
@@ -58,7 +64,13 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     private val popupLocation = IntArray(2)
 
     @Volatile private var pageReady = false
-    @Volatile private var hasChatSelection = false
+    // Cached hints only. A grab is intercepted only after JavaScript confirms,
+    // at that moment, that the live selection is inside a scroll region.
+    @Volatile private var hasRegionSelection = false
+    @Volatile private var regionIsChat = true
+    @Volatile private var hasAnySelection = false
+    // Speed profile of the drag in progress: #chat (accelerating) or a panel.
+    private var dragIsChat = true
     @Volatile private var rectCss = RectF()
     @Volatile private var viewportWidthCss = 1f
     @Volatile private var viewportHeightCss = 1f
@@ -76,7 +88,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     private var fedY = 0f
     private var running = false
     private var lastFrameNanos = 0L
-    // This clock runs only while the handle is actively edge-scrolling #chat.
+    // This clock runs only while the handle is actively edge-scrolling #chat
+    // (settings panels never accelerate).
     // A change of direction, moving out of the edge zone, or lifting the
     // finger resets it, so ordinary handle movement is never accelerated.
     private var edgeScrollDirection = 0
@@ -93,6 +106,10 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     private var pendingRelease: PendingRelease? = null
     private var lastScanMs = 0L
     private val lastScanEnqueuedMs = AtomicLong(0L)
+    // A handle drag that is not assisted (text fields, other pages, text
+    // outside any scroll region). Chromium handles it entirely; we only
+    // observe when it ends.
+    private var passthroughRef: WeakReference<View>? = null
     private var closed = false
     // Capture the genuine DOM fixed endpoint before Chromium receives the
     // first MOVE of a newly grabbed popup handle. WebView JS evaluation is
@@ -112,7 +129,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
 
     fun onNavigationStarted() {
         pageReady = false
-        hasChatSelection = false
+        hasRegionSelection = false
+        hasAnySelection = false
         cancelDrag()
     }
 
@@ -120,7 +138,17 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         pageReady = true
     }
 
+    /**
+     * Chromium shows the selection handles when the long-press finger lifts,
+     * which can be well after the selectionchange that started the last scan.
+     * Re-scan then so the very first handle drag is already hooked.
+     */
+    fun onWebViewTouchEnded() {
+        if (!closed && pageReady) requestScanBurst()
+    }
+
     fun cancelDrag() {
+        endPassthrough()
         stopFrames()
         val wasDeliveredToChromium = nativeDownDelivered
         waitingForAnchorSnapshot = false
@@ -196,6 +224,16 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     @SuppressLint("ClickableViewAccessibility")
     private val interceptor = View.OnTouchListener { handle, event ->
         if (closed || !pageReady) return@OnTouchListener false
+        // An unassisted drag is Chromium's alone: never buffer, clamp or rewrite
+        // it. Only note when it ends so the page can tidy its endpoints.
+        val passthrough = passthroughRef?.get()
+        if (passthrough != null && event.actionMasked != MotionEvent.ACTION_DOWN) {
+            if (passthrough === handle && (event.actionMasked == MotionEvent.ACTION_UP ||
+                    event.actionMasked == MotionEvent.ACTION_CANCEL)) {
+                endPassthrough()
+            }
+            return@OnTouchListener false
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 // A very fast re-grab can occur while a previous JS callback
@@ -209,9 +247,13 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                         cancelDrag()
                     }
                 }
-                if (!hasChatSelection || event.pointerCount != 1) {
+                endPassthrough()
+                if (event.pointerCount != 1) return@OnTouchListener false
+                if (!hasRegionSelection) {
+                    beginPassthrough(handle)
                     return@OnTouchListener false
                 }
+                dragIsChat = regionIsChat
                 gestureGeneration++
                 waitingForAnchorSnapshot = false
                 bufferedDown?.recycle()
@@ -241,10 +283,10 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 dragging = true
                 jitter = false
                 resetAcceleration()
-                webView.evaluateJavascript(
-                    "window.__stSetHandleDragging && window.__stSetHandleDragging(true);", null
-                )
-                Log.d(TAG, "Chat native handle DOWN intercepted")
+                // The drag state (and, for #chat only, hit-test shielding of
+                // the composer, top bar and settings holder) is set by begin()
+                // in JavaScript once it has confirmed the selection's region.
+                Log.d(TAG, "Native handle DOWN held for region verification")
                 // Chromium's TouchHandle::BeginDrag can re-hit-test the
                 // *opposite* endpoint right on ACTION_DOWN. Do not forward DOWN
                 // until the JS snapshot captures its original offscreen node.
@@ -262,32 +304,35 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                     ) { response ->
                         if (closed || generation != gestureGeneration ||
                             !dragging || handleRef?.get() !== handle) return@evaluateJavascript
-                        waitingForAnchorSnapshot = false
                         Log.d(TAG, "Re-grab anchor snapshot: $response")
+                        val role = parseRole(response)
+                        if (role == null) {
+                            // The cached hint was stale: this selection is in
+                            // a text field or elsewhere. Hand the whole
+                            // gesture, unmodified, back to Chromium.
+                            switchToPassthrough(handle)
+                            return@evaluateJavascript
+                        }
+                        dragIsChat = role.isChat
+                        // The timeout below already delivered DOWN; keep going.
+                        if (!waitingForAnchorSnapshot) return@evaluateJavascript
+                        waitingForAnchorSnapshot = false
                         deliverBufferedDown(handle)
                         if (!nativeDownDelivered) {
                             cancelDrag()
                             return@evaluateJavascript
                         }
-                        val move = bufferedMove
-                        bufferedMove = null
-                        if (move != null) {
-                            try { processHandleMove(handle, move) }
-                            finally { move.recycle() }
-                        }
-                        val release = bufferedRelease
-                        bufferedRelease = null
-                        if (release != null) {
-                            try { processHandleRelease(handle, release) }
-                            finally { release.recycle() }
-                        }
+                        replayBuffered(handle)
                     }
                 } catch (error: RuntimeException) {
-                    waitingForAnchorSnapshot = false
                     Log.w(TAG, "Anchor snapshot unavailable; using native handling", error)
-                    deliverBufferedDown(handle)
+                    switchToPassthrough(handle)
+                    return@OnTouchListener true
                 }
-                // Avoid losing the DOWN forever if renderer JavaScript stalls.
+                // Avoid losing the DOWN forever if renderer JavaScript stalls
+                // (e.g. while a reply is streaming). The cached hint said this
+                // selection is in a region, so keep its clamp; a late reply
+                // from begin() that says otherwise still switches to native.
                 webView.postDelayed({
                     if (dragging && generation == gestureGeneration &&
                         waitingForAnchorSnapshot && handleRef?.get() === handle) {
@@ -298,18 +343,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                             cancelDrag()
                             return@postDelayed
                         }
-                        val move = bufferedMove
-                        bufferedMove = null
-                        if (move != null) {
-                            try { processHandleMove(handle, move) }
-                            finally { move.recycle() }
-                        }
-                        val release = bufferedRelease
-                        bufferedRelease = null
-                        if (release != null) {
-                            try { processHandleRelease(handle, release) }
-                            finally { release.recycle() }
-                        }
+                        replayBuffered(handle)
                     }
                 }, 180L)
                 true
@@ -347,6 +381,104 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             }
             else -> false
         }
+    }
+
+    private class Role(val isChat: Boolean)
+
+    /** "upper"/"lower" = #chat; "upper:panel"/"lower:panel" = a settings panel. */
+    private fun parseRole(response: String?): Role? {
+        val parts = (response?.trim()?.removeSurrounding("\"") ?: return null).split(':')
+        if (parts[0] != "upper" && parts[0] != "lower") return null
+        return when (parts.getOrNull(1)) {
+            null -> Role(isChat = true)
+            "panel" -> Role(isChat = false)
+            else -> null
+        }
+    }
+
+    private fun replayBuffered(handle: View) {
+        val move = bufferedMove
+        bufferedMove = null
+        if (move != null) {
+            try { processHandleMove(handle, move) }
+            finally { move.recycle() }
+        }
+        val release = bufferedRelease
+        bufferedRelease = null
+        if (release != null) {
+            try { processHandleRelease(handle, release) }
+            finally { release.recycle() }
+        }
+    }
+
+    private fun notifyNativeHandleActive(active: Boolean) {
+        try {
+            webView.evaluateJavascript(
+                "window.__stNativeHandleActive && window.__stNativeHandleActive($active);", null
+            )
+        } catch (_: RuntimeException) { }
+    }
+
+    private fun beginPassthrough(handle: View) {
+        passthroughRef = WeakReference(handle)
+        notifyNativeHandleActive(true)
+    }
+
+    private fun endPassthrough() {
+        if (passthroughRef == null) return
+        passthroughRef = null
+        notifyNativeHandleActive(false)
+    }
+
+    /**
+     * Abandons region interception for this gesture and gives Chromium the
+     * genuine events: the held DOWN plus anything buffered, then every later
+     * event directly (the listener returns false while passthrough is set).
+     */
+    private fun switchToPassthrough(handle: View) {
+        val down = bufferedDown
+        val move = bufferedMove
+        val release = bufferedRelease
+        bufferedDown = null
+        bufferedMove = null
+        bufferedRelease = null
+        val downWasDelivered = nativeDownDelivered
+        val deferredRelease = pendingRelease
+        stopFrames()
+        waitingForAnchorSnapshot = false
+        dragging = false
+        handleRef = null
+        nativeDownDelivered = false
+        pendingScrollSteps = 0
+        pendingRelease = null
+        scrolledDuringGesture = false
+        gestureGeneration++
+        webView.evaluateJavascript(
+            "window.__stSetHandleDragging && window.__stSetHandleDragging(false);", null
+        )
+        beginPassthrough(handle)
+        var ended = false
+        try {
+            if (handle.isAttachedToWindow) {
+                if (down != null) handle.onTouchEvent(down)
+                if (move != null) handle.onTouchEvent(move)
+                if (release != null) {
+                    handle.onTouchEvent(release)
+                    ended = true
+                } else if (deferredRelease != null && downWasDelivered) {
+                    forwardSynthetic(handle, deferredRelease.action, fedX, fedY,
+                        deferredRelease.eventTime)
+                    ended = true
+                }
+            } else {
+                ended = true
+            }
+        } finally {
+            down?.recycle()
+            move?.recycle()
+            release?.recycle()
+        }
+        if (ended) endPassthrough()
     }
 
     private fun deliverBufferedDown(handle: View) {
@@ -457,13 +589,14 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         val tipY = fingerY - fingerOffsetY
         val zone = dp(EDGE_ZONE_DP)
         val overshootMax = dp(MAX_OVERSHOOT_DP)
+        val maxSpeed = if (dragIsChat) MAX_SPEED_DP_S else PANEL_MAX_SPEED_DP_S
         var v = 0f
         if (tipY < top + zone && canScrollUp) {
             val t = ((top + zone - tipY) / overshootMax).coerceIn(0f, 1f)
-            v = -(MIN_SPEED_DP_S + (MAX_SPEED_DP_S - MIN_SPEED_DP_S) * t * t)
+            v = -(MIN_SPEED_DP_S + (maxSpeed - MIN_SPEED_DP_S) * t * t)
         } else if (tipY > bottom - zone && canScrollDown) {
             val t = ((tipY - (bottom - zone)) / overshootMax).coerceIn(0f, 1f)
-            v = MIN_SPEED_DP_S + (MAX_SPEED_DP_S - MIN_SPEED_DP_S) * t * t
+            v = MIN_SPEED_DP_S + (maxSpeed - MIN_SPEED_DP_S) * t * t
         }
         val topInset = dp(if (canScrollUp) TOP_SAFE_DP else 14f)
         val bottomInset = dp(if (canScrollDown) BOTTOM_SAFE_DP else 4f)
@@ -490,6 +623,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             resetAcceleration()
             return 0f
         }
+        // Only the long chat accelerates; settings panels keep a steady speed.
+        if (!dragIsChat) return baseVelocity
         if (direction != edgeScrollDirection) {
             edgeScrollDirection = direction
             edgeScrollStartedMs = nowMs
@@ -543,7 +678,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             val accelerated = acceleratedVelocity(
                 result.velocity, SystemClock.uptimeMillis()
             )
-            // Let the JS side scroll #chat without rewriting Range/Selection.
+            // Let the JS side scroll the region without rewriting Range/Selection.
             val delta = accelerated * deltaSeconds
             if (delta.isFinite()) {
                 // The JavaScript scroll and Chromium's MOVE are on different
@@ -599,10 +734,28 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         Choreographer.getInstance().removeFrameCallback(frameCallback)
     }
 
-    private fun scanForHandles() {
-        if (closed || !pageReady || !hasChatSelection) return
+    /**
+     * Hooks Chromium's handle popups for ANY selection, not only chat ones, so
+     * that the first chat drag is never missed and non-chat drags can be
+     * observed (never modified). Popups can appear some time after the
+     * selection, so scan a few times over ~1.2s; bursts are coalesced.
+     */
+    private fun requestScanBurst() {
         val now = SystemClock.uptimeMillis()
-        if (now - lastScanMs < 180) return
+        val previous = lastScanEnqueuedMs.get()
+        if (now - previous < 300L || !lastScanEnqueuedMs.compareAndSet(previous, now)) return
+        webView.post {
+            scanForHandles()
+            for (delay in longArrayOf(120L, 300L, 650L, 1_200L)) {
+                webView.postDelayed({ scanForHandles() }, delay)
+            }
+        }
+    }
+
+    private fun scanForHandles() {
+        if (closed || !pageReady || !hasAnySelection || dragging) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastScanMs < 100) return
         lastScanMs = now
         val roots: List<View> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try { WindowInspector.getGlobalWindowViews() } catch (_: Throwable) { emptyList() }
@@ -636,33 +789,30 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     private inner class SelectionBridge {
         @JavascriptInterface
         fun onSelectionStateChanged(
-            inside: Boolean, left: Float, top: Float, right: Float, bottom: Float,
+            inside: Boolean, anySelection: Boolean, isChat: Boolean,
+            left: Float, top: Float, right: Float, bottom: Float,
             cssWidth: Float, cssHeight: Float, scrollUp: Boolean, scrollDown: Boolean
         ) {
             if (closed || !pageReady) return
+            hasAnySelection = anySelection
             if (!left.isFinite() || !top.isFinite() || !right.isFinite() ||
                 !bottom.isFinite() || !cssWidth.isFinite() || !cssHeight.isFinite() ||
-                cssWidth <= 0 || cssHeight <= 0 || right <= left || bottom <= top) return
-            hasChatSelection = inside
-            rectCss = RectF(left, top, right, bottom)
-            viewportWidthCss = cssWidth
-            viewportHeightCss = cssHeight
-            canScrollUp = scrollUp
-            canScrollDown = scrollDown
-            if (inside) {
-                // selectionchange and chat scrolling can each fire dozens of
-                // times a second. Never enqueue a new 3-scan batch per event.
-                val now = SystemClock.uptimeMillis()
-                val previous = lastScanEnqueuedMs.get()
-                if (now - previous >= 320L &&
-                    lastScanEnqueuedMs.compareAndSet(previous, now)) {
-                    webView.post {
-                        scanForHandles()
-                        webView.postDelayed({ scanForHandles() }, 85)
-                        webView.postDelayed({ scanForHandles() }, 240)
-                    }
-                }
+                cssWidth <= 0 || cssHeight <= 0 || right <= left || bottom <= top) {
+                // Without usable region geometry there is nothing to clamp to.
+                // Never leave a stale "region selection" flag behind.
+                hasRegionSelection = false
+            } else {
+                rectCss = RectF(left, top, right, bottom)
+                viewportWidthCss = cssWidth
+                viewportHeightCss = cssHeight
+                canScrollUp = scrollUp
+                canScrollDown = scrollDown
+                regionIsChat = isChat
+                hasRegionSelection = inside
             }
+            // selectionchange and chat scrolling can each fire dozens of
+            // times a second; requestScanBurst() coalesces them.
+            if (anySelection) requestScanBurst()
         }
     }
 }
