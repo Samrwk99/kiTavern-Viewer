@@ -32,6 +32,9 @@ class SettingsFragment : Fragment() {
     private lateinit var spinnerTheme: Spinner
     private lateinit var btnSave: Button
     private lateinit var btnReload: Button
+    private lateinit var textExternalBrowserStatus: TextView
+    private lateinit var btnChooseExternalBrowser: Button
+    private lateinit var btnResetExternalBrowser: Button
     private lateinit var textBatteryStatus: TextView
     private lateinit var btnBatteryExemption: Button
     private lateinit var btnBatterySettings: Button
@@ -63,6 +66,9 @@ class SettingsFragment : Fragment() {
         spinnerTheme = view.findViewById(R.id.spinnerTheme)
         btnSave = view.findViewById(R.id.buttonSave)
         btnReload = view.findViewById(R.id.buttonReload)
+        textExternalBrowserStatus = view.findViewById(R.id.textExternalBrowserStatus)
+        btnChooseExternalBrowser = view.findViewById(R.id.buttonChooseExternalBrowser)
+        btnResetExternalBrowser = view.findViewById(R.id.buttonResetExternalBrowser)
         textBatteryStatus = view.findViewById(R.id.textBatteryStatus)
         btnBatteryExemption = view.findViewById(R.id.buttonBatteryExemption)
         btnBatterySettings = view.findViewById(R.id.buttonBatterySettings)
@@ -143,6 +149,20 @@ class SettingsFragment : Fragment() {
             onReload?.invoke()
             dismiss()
         }
+
+        fun updateExternalBrowserPreference() {
+            textExternalBrowserStatus.text =
+                "Current: ${ExternalBrowserLauncher.selectedBrowserDescription(ctx)}"
+            btnResetExternalBrowser.isEnabled = KioskPrefs.getExternalBrowserPackage(ctx) != null
+        }
+        btnChooseExternalBrowser.setOnClickListener {
+            activity?.let { ExternalBrowserLauncher.chooseInSettings(it) { updateExternalBrowserPreference() } }
+        }
+        btnResetExternalBrowser.setOnClickListener {
+            KioskPrefs.setExternalBrowserPackage(ctx, null)
+            updateExternalBrowserPreference()
+        }
+        updateExternalBrowserPreference()
 
         btnBatteryExemption.setOnClickListener { requestBatteryExemption(ctx) }
         btnBatterySettings.setOnClickListener { openAppBatterySettings(ctx) }

@@ -60,6 +60,18 @@ object KioskPrefs {
         getInstance(context).edit().putString("app_theme", safe).apply()
     }
 
+    /** null = ask for a browser for each external link. */
+    fun getExternalBrowserPackage(context: Context): String? =
+        getInstance(context).getString("external_browser_package", null)
+            ?.takeIf { it.isNotBlank() }
+
+    fun setExternalBrowserPackage(context: Context, packageName: String?) {
+        val editor = getInstance(context).edit()
+        if (packageName.isNullOrBlank()) editor.remove("external_browser_package")
+        else editor.putString("external_browser_package", packageName)
+        editor.apply()
+    }
+
     /** Preserve the existing behaviour unless the user explicitly disables it. */
     fun getAutoFocusChatInput(context: Context): Boolean =
         getInstance(context).getBoolean("auto_focus_chat_input", true)
