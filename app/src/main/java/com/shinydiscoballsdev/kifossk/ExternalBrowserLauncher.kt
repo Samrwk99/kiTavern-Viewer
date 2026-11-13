@@ -209,20 +209,34 @@ internal object ExternalBrowserLauncher {
         } catch (_: Exception) { false }
     }
 
+    // Only one picker may exist at a time; a second link event (e.g. WebView
+    // navigation plus popup) must not stack a duplicate underneath the first.
+    private var activePicker: AlertDialog? = null
+
+    /** Closes the "Open link with" picker if it is showing. */
+    fun dismissPicker() {
+        val dialog = activePicker
+        activePicker = null
+        try { dialog?.dismiss() } catch (_: Exception) { }
+    }
+
     private fun showPicker(activity: Activity, url: Uri) {
+        dismissPicker()
         val choices = browserChoices(activity)
         var selected = 0 // Default browser is the initial selection.
-        AlertDialog.Builder(activity)
+        val dialog = AlertDialog.Builder(activity)
             .setTitle("Open link with")
             .setSingleChoiceItems(iconChoicesAdapter(activity, choices), selected) { _, which ->
                 selected = which
             }
             .setNegativeButton("Just once") { _, _ ->
+                dismissPicker()
                 if (!launch(activity, url, choices[selected].packageName!!)) {
                     Toast.makeText(activity, "Unable to open selected browser", Toast.LENGTH_LONG).show()
                 }
             }
             .setPositiveButton("Always") { _, _ ->
+                dismissPicker()
                 val pkg = choices[selected].packageName!!
                 if (launch(activity, url, pkg)) {
                     KioskPrefs.setExternalBrowserPackage(activity, pkg)
@@ -231,7 +245,10 @@ internal object ExternalBrowserLauncher {
                 }
             }
             .setNeutralButton("Cancel", null)
-            .show()
+            .create()
+        dialog.setOnDismissListener { if (activePicker === dialog) activePicker = null }
+        activePicker = dialog
+        dialog.show()
     }
 
     fun chooseInSettings(activity: Activity, onChanged: () -> Unit) {

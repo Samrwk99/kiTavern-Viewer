@@ -1864,6 +1864,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        // The browser picker must not still be showing when we return from the browser.
+        ExternalBrowserLauncher.dismissPicker()
         activityResumed = false
         updateNoPagePinger()
         super.onStop()
