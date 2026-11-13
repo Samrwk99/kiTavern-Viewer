@@ -1816,7 +1816,12 @@ class MainActivity : AppCompatActivity() {
             val results = if (data == null || resultCode != RESULT_OK) {
                 null
             } else {
-                WebChromeClient.FileChooserParams.parseResult(resultCode, data)
+                data.clipData?.let { clip ->
+                    (0 until clip.itemCount)
+                        .mapNotNull { clip.getItemAt(it).uri }
+                        .toTypedArray()
+                        .takeIf { it.isNotEmpty() }
+                } ?: WebChromeClient.FileChooserParams.parseResult(resultCode, data)
             }
             filePathCallback?.onReceiveValue(results)
             filePathCallback = null
