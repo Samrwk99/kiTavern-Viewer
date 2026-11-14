@@ -6,9 +6,10 @@
  *
  * One selection system: Chromium's. The native side assists a handle drag
  * only when begin() below confirms, at grab time, that the live selection is
- * page text inside one scroll region: #chat, or a settings/drawer panel. It
- * then keeps the handle inside that region and scrolls it at the edges.
- * Selections inside text fields, and anything else, stay fully native.
+ * page text inside one scroll region (#chat, or a settings/drawer panel) or
+ * text selected inside a text field. It then keeps the handle inside that
+ * region (above the keyboard) and scrolls it at the edges: fast in #chat,
+ * gently everywhere else. Anything else stays fully native.
  */
 (function () {
     'use strict';
@@ -54,6 +55,12 @@
     // and the region of the current selection used for geometry reports.
     var activeRegion = null;
     var reportRegion = null;
+    var activeIsField = false;
+    // Long-press drag (press a word and drag without lifting): the selection
+    // must have been made by the current touch, never an older one.
+    var longPressActive = false;
+    var lastTouchStart = -Infinity;
+    var lastSelectionChange = -Infinity;
 
     function inNode(root, node) {
         return !!(root && node && (node === root || root.contains(node)));
@@ -66,11 +73,9 @@
     }
     // Page text selected inside one scroll region. Selections in text fields
     // are reported collapsed by Chromium and are never assisted.
-    function selectionRegion(s) {
-        if (!s || s.rangeCount !== 1 || s.isCollapsed) return null;
-        if (inChat(s.anchorNode) && inChat(s.focusNode)) return chat;
-        var n = s.getRangeAt(0).commonAncestorContainer;
-        if (n && n.nodeType !== 1) n = n.parentElement;
+    // Nearest scroll box holding a node (never the chat shell or an editor).
+    function scrollerOf(node) {
+        var n = node && (node.nodeType === 1 ? node : node.parentElement);
         var shell = document.getElementById('sheld');
         for (; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
             if (n.isContentEditable || n === shell) return null;
@@ -78,11 +83,65 @@
         }
         return null;
     }
+    // movingEnd: the DOM end whose handle is being dragged, when known.
+    function selectionRegion(s, movingEnd) {
+        if (!s || s.rangeCount !== 1 || s.isCollapsed) return null;
+        var anchorInChat = inChat(s.anchorNode), focusInChat = inChat(s.focusNode);
+        if (anchorInChat && focusInChat) return chat;
+        // Half in the chat: the chat backstop below handles it (unchanged).
+        if (anchorInChat || focusInChat) return null;
+        var range = s.getRangeAt(0);
+        var shared = scrollerOf(range.commonAncestorContainer);
+        if (shared) return shared;
+        // The ends sit in different boxes, e.g. a panel's header or menu text
+        // and its scrolling list: use the box of the end being moved.
+        var moving = movingEnd || s.focusNode;
+        var fixed = moving === range.startContainer ? range.endContainer : range.startContainer;
+        return scrollerOf(moving) || scrollerOf(fixed);
+    }
+    // A text field (textarea/input) holding a non-empty selection. Chromium
+    // reports those to getSelection() as collapsed, so ask the field.
+    function activeFieldSelection() {
+        var el = document.activeElement;
+        if (!el || (el.tagName !== 'TEXTAREA' && el.tagName !== 'INPUT')) return null;
+        try {
+            if (typeof el.selectionStart !== 'number' ||
+                el.selectionStart === el.selectionEnd) return null;
+        } catch (_) { return null; }
+        return el;
+    }
+    // The field itself when its text scrolls, else the box that scrolls it.
+    function fieldRegion(field) {
+        if (field.tagName === 'TEXTAREA' && field.scrollHeight > field.clientHeight + 1) {
+            return field;
+        }
+        for (var n = field.parentElement; n && n !== document.body &&
+                n !== document.documentElement; n = n.parentElement) {
+            if (scrollsY(n)) return n;
+        }
+        return null;
+    }
+    function hasPageSelection(s) {
+        return !!(s && s.rangeCount === 1 && !s.isCollapsed);
+    }
+    // A real page selection always wins over a text field that merely kept
+    // its old inner selection after the user long-pressed elsewhere.
+    function currentRegion(s) {
+        if (hasPageSelection(s)) return selectionRegion(s);
+        var field = activeFieldSelection();
+        return field ? fieldRegion(field) : null;
+    }
+    // Bottom of what the user can see: the keyboard covers the rest.
+    function keyboardTop() {
+        var lift = window.__kiTavernKeyboardLift;
+        var top = lift && lift.visibleBottom ? lift.visibleBottom() : innerHeight;
+        return Number.isFinite(top) ? Math.min(innerHeight, top) : innerHeight;
+    }
     // The part of a region that is actually on screen.
     function visibleRect(el) {
         var r = el.getBoundingClientRect();
         var box = {left: Math.max(0, r.left), top: Math.max(0, r.top),
-            right: Math.min(innerWidth, r.right), bottom: Math.min(innerHeight, r.bottom)};
+            right: Math.min(innerWidth, r.right), bottom: Math.min(keyboardTop(), r.bottom)};
         if (el !== chat) {
             for (var p = el.parentElement; p && p !== document.body; p = p.parentElement) {
                 var cs = getComputedStyle(p);
@@ -111,15 +170,17 @@
         if (!force && now - lastReportTime < 24) return;
         lastReportTime = now;
         var s = window.getSelection();
-        var anySelection = !!(s && s.rangeCount === 1 && !s.isCollapsed);
-        var region = activeRegion || (anySelection ? selectionRegion(s) : null);
+        var fieldOnly = !hasPageSelection(s) && !!activeFieldSelection();
+        var anySelection = hasPageSelection(s) || fieldOnly;
+        var region = activeRegion || (anySelection ? currentRegion(s) : null);
         reportRegion = region;
         var geometry = region || chat;
         var r = visibleRect(geometry);
         // Convert CSS viewport positions into Android WebView coordinates on
         // the native side using innerWidth/innerHeight (not fixed dp scales).
         window.STSelectionBridge.onSelectionStateChanged(
-            !!region, anySelection, geometry === chat, r.left, r.top, r.right, r.bottom,
+            !!region, anySelection,
+            geometry === chat && !(activeRegion ? activeIsField : fieldOnly), r.left, r.top, r.right, r.bottom,
             Math.max(1, window.innerWidth), Math.max(1, window.innerHeight),
             geometry.scrollTop > 0.5,
             geometry.scrollTop + geometry.clientHeight < geometry.scrollHeight - 0.5
@@ -136,7 +197,7 @@
         // Hit-test shielding is for chat drags only: in a settings panel it
         // would block the very text being selected.
         document.body && document.body.classList.toggle('st-handle-dragging',
-            !!isDragging && activeRegion === chat);
+            !!isDragging && activeRegion === chat && !activeIsField);
         report(true);
         if (!isDragging) {
             // Chromium applies the final MOVE/UP asynchronously to this call.
@@ -358,24 +419,55 @@
         var lastPointX = NaN, lastPointY = NaN;
         var repairs = 0, lastRepair = -Infinity, repairing = false;
 
-        function endpointRect(node, offset) {
+        function emptyRect(r) {
+            return !r || (!r.top && !r.bottom && !r.left && !r.right);
+        }
+        // #chat: the original measurement, unchanged (its repair depends on
+        // it). Settings panels: where the handle for this DOM end is drawn.
+        // Beside a field or block Chromium reports an empty rect for the
+        // collapsed range, so use the neighbouring line (or field) instead.
+        function endpointRect(node, offset, forChat) {
             try {
                 var r = document.createRange();
                 r.setStart(node, offset);
                 r.collapse(true);
-                return r.getBoundingClientRect();
+                var rect = r.getBoundingClientRect();
+                if (forChat || !emptyRect(rect) || node.nodeType !== 1) return rect;
+                var after = node.childNodes[offset], before = node.childNodes[offset - 1];
+                var near = after || before;
+                if (near) {
+                    var lines = document.createRange();
+                    lines.selectNodeContents(near);
+                    var rects = lines.getClientRects();
+                    if (rects.length) {
+                        var line = after ? rects[0] : rects[rects.length - 1];
+                        if (!emptyRect(line)) return line;
+                    }
+                    var nr = document.createRange();
+                    nr.selectNode(near);
+                    var nearRect = nr.getBoundingClientRect();
+                    if (!emptyRect(nearRect)) return nearRect;
+                }
+                return node.getBoundingClientRect();
             } catch (_) { return null; }
         }
         function same(node, offset) {
             return node === lockedNode && offset === lockedOffset;
         }
         function stop() {
+            longPressActive = false;
             activeRegion = null;
+            activeIsField = false;
             lockedNode = null; lockedOffset = 0; role = null;
             repairing = false; repairs = 0;
             lastPointX = NaN; lastPointY = NaN;
         }
         function repairIfNeeded() {
+            // #chat only. In settings panels the point under the handle is
+            // often a slider, input or unselectable label, and "repairing"
+            // from it threw the selection to the top of the panel, which
+            // Chromium then scrolled to at full speed.
+            if (activeRegion !== chat || activeIsField) return;
             if (!role || repairing || !lockedNode || !lockedNode.isConnected ||
                 !inRegion(lockedNode)) return;
             var sel = window.getSelection();
@@ -416,7 +508,9 @@
                 repairs++;
                 lastRepair = now;
             } catch (_) {
-                stop();
+                // Give up on repairs for this drag, but keep the region:
+                // edge scrolling must carry on.
+                role = null; lockedNode = null;
             } finally {
                 repairing = false;
             }
@@ -429,17 +523,36 @@
             begin: function (x, y) {
                 stop();
                 var sel = window.getSelection();
-                if (!sel || sel.isCollapsed || sel.rangeCount !== 1) return 'none';
-                var region = selectionRegion(sel);
-                if (!region) return 'outside';
+                var field = hasPageSelection(sel) ? null : activeFieldSelection();
+                if (field) {
+                    // Inside a text field Chromium keeps both ends in place;
+                    // only the region is clamped and scrolled (no DOM repair).
+                    var fieldBox = fieldRegion(field);
+                    if (!fieldBox) return 'outside';
+                    activeRegion = fieldBox;
+                    activeIsField = true;
+                    setHandleDragging(true);
+                    return 'lower:field';
+                }
+                if (!hasPageSelection(sel)) return 'none';
                 var r = sel.getRangeAt(0);
-                var a = endpointRect(r.startContainer, r.startOffset);
-                var b = endpointRect(r.endContainer, r.endOffset);
+                var forChat = inChat(sel.anchorNode) && inChat(sel.focusNode);
+                var a = endpointRect(r.startContainer, r.startOffset, forChat);
+                var b = endpointRect(r.endContainer, r.endOffset, forChat);
                 if (!a || !b || !Number.isFinite(y)) return 'no-rect';
-                // Pick the DOM endpoint nearest the real popup handle tip.
+                // Pick the DOM endpoint nearest the real popup handle tip; in a
+                // settings panel a single line is decided horizontally.
                 var upperDistance = Math.abs(a.bottom - y);
                 var lowerDistance = Math.abs(b.bottom - y);
+                if (!forChat && Math.abs(upperDistance - lowerDistance) < 6 &&
+                    Number.isFinite(x)) {
+                    upperDistance = Math.abs(a.left - x);
+                    lowerDistance = Math.abs(b.right - x);
+                }
                 role = upperDistance <= lowerDistance ? 'upper' : 'lower';
+                var region = selectionRegion(sel,
+                    role === 'upper' ? r.startContainer : r.endContainer);
+                if (!region) { role = null; return 'outside'; }
                 lockedNode = role === 'upper' ? r.endContainer : r.startContainer;
                 lockedOffset = role === 'upper' ? r.endOffset : r.startOffset;
                 lastPointX = x; lastPointY = y - 12; // Caret is above the handle tip.
@@ -457,11 +570,40 @@
             end: stop
         };
     })();
+    // ---- Long-press drag -------------------------------------------------
+    // Called by the native side once a finger that long-pressed a word starts
+    // dragging. Same regions and same scrolling as a handle drag; no DOM
+    // endpoint repair (Chromium decides which end moves with the finger).
+    window.__stLongPressDragBegin = function () {
+        if (!(lastSelectionChange > lastTouchStart)) return 'stale';
+        var s = window.getSelection();
+        if (!hasPageSelection(s)) return 'none';
+        var region = selectionRegion(s);
+        if (!region) return 'outside';
+        window.__stSelectionAnchorLock.end();
+        activeRegion = region;
+        activeIsField = false;
+        longPressActive = true;
+        setHandleDragging(true);
+        return region === chat ? 'chat' : 'panel';
+    };
+    // Ends only a long-press drag, never a handle drag begun meanwhile.
+    window.__stLongPressDragEnd = function () {
+        if (longPressActive) setHandleDragging(false);
+    };
+    window.addEventListener('touchstart', function () {
+        lastTouchStart = performance.now();
+    }, {capture:true, passive:true});
+
+    // Capture: text fields fire selectionchange/select at the field itself.
     document.addEventListener('selectionchange', function () {
+        if (hasPageSelection(window.getSelection())) lastSelectionChange = performance.now();
         window.__stSelectionAnchorLock.check();
         scheduleConfine();
         report(true);
-    }, {passive:true});
+    }, {capture:true, passive:true});
+    document.addEventListener('select', function () { report(true); },
+        {capture:true, passive:true});
     chat.addEventListener('scroll', function () { report(false); }, {passive:true});
     // Settings panels: report while the region of the selection scrolls.
     document.addEventListener('scroll', function (e) {
@@ -472,5 +614,5 @@
     window.addEventListener('resize', function () { report(true); }, {passive:true});
     window.addEventListener('pageshow', function () { report(true); }, {passive:true});
     report(true);
-    return 'native-popup-handle-bridge-v3';
+    return 'native-popup-handle-bridge-v6';
 })();

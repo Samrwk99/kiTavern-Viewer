@@ -26,10 +26,10 @@ import kotlin.math.sign
  *
  * The touch handles are separate PopupWindow views; the ordinary WebView
  * OnTouchListener cannot see their drag stream. This class hooks *only* those
- * views, and only changes their coordinates for page text selected inside one
- * scroll region (#chat, or a settings/drawer panel), confirmed by the page at
- * the moment the handle is grabbed. Selections inside text fields, and
- * anything else, stay fully native.
+ * views, and only changes their coordinates for text selected inside one
+ * scroll region (#chat, a settings/drawer panel, or a text field), confirmed
+ * by the page at the moment the handle is grabbed. Anything else stays fully
+ * native.
  * Incompatible WebView implementations automatically fall back to native input.
  *
  * SillyTavern files are unchanged. A guarded DOM-anchor recovery runs only
@@ -44,9 +44,10 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         private const val MAX_OVERSHOOT_DP = 96f
         private const val MIN_SPEED_DP_S = 45f
         private const val MAX_SPEED_DP_S = 750f
-        // Settings panels are short and dense: a gentler, constant top speed
-        // with no time-based acceleration.
-        private const val PANEL_MAX_SPEED_DP_S = 360f
+        // Settings panels and text fields are short and dense: a gentle,
+        // constant speed range with no time-based acceleration.
+        private const val PANEL_MIN_SPEED_DP_S = 30f
+        private const val PANEL_MAX_SPEED_DP_S = 1_000f
         // Only sustained native-handle edge auto-scrolling accelerates.
         // Every 1.5 seconds in one direction adds 40%, up to 4x the usual speed.
         private const val ACCELERATION_INTERVAL_MS = 1_500L
@@ -68,8 +69,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     // at that moment, that the live selection is inside a scroll region.
     @Volatile private var hasRegionSelection = false
     @Volatile private var regionIsChat = true
-    @Volatile private var hasAnySelection = false
-    // Speed profile of the drag in progress: #chat (accelerating) or a panel.
+    // Speed profile of the drag in progress: #chat (fast, accelerating) or a
+    // settings panel / text field (gentle, constant).
     private var dragIsChat = true
     @Volatile private var rectCss = RectF()
     @Volatile private var viewportWidthCss = 1f
@@ -130,7 +131,6 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     fun onNavigationStarted() {
         pageReady = false
         hasRegionSelection = false
-        hasAnySelection = false
         cancelDrag()
     }
 
@@ -148,6 +148,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     }
 
     fun cancelDrag() {
+        lpCancel()
         endPassthrough()
         stopFrames()
         val wasDeliveredToChromium = nativeDownDelivered
@@ -249,10 +250,10 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 }
                 endPassthrough()
                 if (event.pointerCount != 1) return@OnTouchListener false
-                if (!hasRegionSelection) {
-                    beginPassthrough(handle)
-                    return@OnTouchListener false
-                }
+                // Always ask the page about the LIVE selection; a cached report
+                // can be stale and would hand the drag to Chromium's own
+                // (fast, unclamped) handling. Unassisted drags are handed back
+                // unmodified once the page answers, a frame or so later.
                 dragIsChat = regionIsChat
                 gestureGeneration++
                 waitingForAnchorSnapshot = false
@@ -336,6 +337,11 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 webView.postDelayed({
                     if (dragging && generation == gestureGeneration &&
                         waitingForAnchorSnapshot && handleRef?.get() === handle) {
+                        if (!hasRegionSelection) {
+                            Log.w(TAG, "Region check timeout; leaving drag native")
+                            switchToPassthrough(handle)
+                            return@postDelayed
+                        }
                         Log.w(TAG, "Anchor snapshot timeout; forwarding real DOWN")
                         waitingForAnchorSnapshot = false
                         deliverBufferedDown(handle)
@@ -385,13 +391,16 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
 
     private class Role(val isChat: Boolean)
 
-    /** "upper"/"lower" = #chat; "upper:panel"/"lower:panel" = a settings panel. */
+    /**
+     * "upper"/"lower" = #chat; "upper:panel"/"lower:panel" = a settings panel;
+     * "lower:field" = a selection inside a text field.
+     */
     private fun parseRole(response: String?): Role? {
         val parts = (response?.trim()?.removeSurrounding("\"") ?: return null).split(':')
         if (parts[0] != "upper" && parts[0] != "lower") return null
         return when (parts.getOrNull(1)) {
             null -> Role(isChat = true)
-            "panel" -> Role(isChat = false)
+            "panel", "field" -> Role(isChat = false)
             else -> null
         }
     }
@@ -582,24 +591,29 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         val bottom = screenLocation[1] + bounds.bottom * scaleY
         // Fail open on stale/invalid geometry instead of shifting a native
         // selection handle into a completely unrelated place.
-        if (right - left < dp(60f) || bottom - top < dp(80f)) {
+        if (right - left < dp(60f) || bottom - top < dp(if (dragIsChat) 80f else 40f)) {
             return Feed(fingerX, fingerY, 0f)
         }
         val tipX = fingerX - fingerOffsetX
         val tipY = fingerY - fingerOffsetY
-        val zone = dp(EDGE_ZONE_DP)
+        // A text field can be short: scale the edge zone and insets to it so
+        // the middle of the field still selects without scrolling. #chat
+        // keeps its original, unscaled values.
+        val scaleLimit = if (dragIsChat) Float.MAX_VALUE else bottom - top
+        val zone = minOf(dp(EDGE_ZONE_DP), scaleLimit * 0.22f)
         val overshootMax = dp(MAX_OVERSHOOT_DP)
+        val minSpeed = if (dragIsChat) MIN_SPEED_DP_S else PANEL_MIN_SPEED_DP_S
         val maxSpeed = if (dragIsChat) MAX_SPEED_DP_S else PANEL_MAX_SPEED_DP_S
         var v = 0f
         if (tipY < top + zone && canScrollUp) {
             val t = ((top + zone - tipY) / overshootMax).coerceIn(0f, 1f)
-            v = -(MIN_SPEED_DP_S + (maxSpeed - MIN_SPEED_DP_S) * t * t)
+            v = -(minSpeed + (maxSpeed - minSpeed) * t * t)
         } else if (tipY > bottom - zone && canScrollDown) {
             val t = ((tipY - (bottom - zone)) / overshootMax).coerceIn(0f, 1f)
-            v = MIN_SPEED_DP_S + (maxSpeed - MIN_SPEED_DP_S) * t * t
+            v = minSpeed + (maxSpeed - minSpeed) * t * t
         }
-        val topInset = dp(if (canScrollUp) TOP_SAFE_DP else 14f)
-        val bottomInset = dp(if (canScrollDown) BOTTOM_SAFE_DP else 4f)
+        val topInset = minOf(dp(if (canScrollUp) TOP_SAFE_DP else 14f), scaleLimit * 0.18f)
+        val bottomInset = minOf(dp(if (canScrollDown) BOTTOM_SAFE_DP else 4f), scaleLimit * 0.18f)
         val clampedTipX = tipX.coerceIn(left + dp(SIDE_SAFE_DP),
             max(left + dp(SIDE_SAFE_DP) + 1f, right - dp(SIDE_SAFE_DP)))
         val clampedTipY = tipY.coerceIn(top + topInset,
@@ -753,7 +767,9 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     }
 
     private fun scanForHandles() {
-        if (closed || !pageReady || !hasAnySelection || dragging) return
+        // Not gated on the reported selection state: text-field selections
+        // may not report on every WebView version, and scans are cheap.
+        if (closed || !pageReady || dragging) return
         val now = SystemClock.uptimeMillis()
         if (now - lastScanMs < 100) return
         lastScanMs = now
@@ -786,6 +802,335 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         }
     }
 
+    // ---- Long-press drag ----------------------------------------------------
+    // Long-press a word and, without lifting, drag: Chromium extends the
+    // selection from the WebView's own touch stream, not from a handle popup,
+    // so the handle assistance above never sees it. This path gives that
+    // gesture the same clamp and edge auto-scroll. It runs only after the page
+    // confirms the selection was made by THIS touch and sits in a scroll region
+    // (#chat or a settings panel); every other WebView touch passes untouched.
+
+    private enum class LongPressState { IDLE, CHECKING, ASSIST, NATIVE }
+
+    // Uptime of the last report that carried a selection (pre-check only).
+    @Volatile private var lastSelectionReportMs = 0L
+    private var lpState = LongPressState.NATIVE
+    private var lpDownTime = 0L
+    private var lpPointerId = 0
+    private var lpDeviceId = 0
+    private var lpSource = InputDevice.SOURCE_TOUCHSCREEN
+    private var lpGeneration = 0L
+    private var lpPendingSteps = 0
+    private var lpScrolled = false
+    private var lpPendingRelease: PendingRelease? = null
+    private var lpRunning = false
+    private var lpLastFrameNanos = 0L
+    private var lpJitter = false
+    private var lpRawX = 0f
+    private var lpRawY = 0f
+    private var lpFedX = 0f
+    private var lpFedY = 0f
+
+    /**
+     * Every WebView touch, called from MainActivity's WebView touch listener.
+     * Returns true only for events this class has itself forwarded (with a
+     * clamped position) to the WebView during an assisted long-press drag.
+     */
+    fun onWebViewTouch(event: MotionEvent): Boolean {
+        if (closed || !pageReady) return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lpFlushPendingRelease()
+                lpGeneration++
+                lpState = if (event.pointerCount == 1 && !dragging)
+                    LongPressState.IDLE else LongPressState.NATIVE
+                lpDownTime = event.downTime
+                lpPointerId = event.getPointerId(0)
+                lpDeviceId = event.deviceId
+                lpSource = event.source
+                lpRawX = event.rawX
+                lpRawY = event.rawY
+                return false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                when (lpState) {
+                    LongPressState.ASSIST -> {
+                        if (event.pointerCount != 1) {
+                            lpStopAssist()
+                            return false
+                        }
+                        lpMove(event)
+                        return true
+                    }
+                    LongPressState.IDLE -> {
+                        lpRawX = event.rawX
+                        lpRawY = event.rawY
+                        lpMaybeBegin(event)
+                    }
+                    LongPressState.CHECKING -> {
+                        lpRawX = event.rawX
+                        lpRawY = event.rawY
+                    }
+                    LongPressState.NATIVE -> { }
+                }
+                return false
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (lpState == LongPressState.ASSIST) {
+                    lpRelease(event)
+                    return true
+                }
+                lpState = LongPressState.NATIVE
+                return false
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                // A second finger: stop assisting and let Chromium have the rest.
+                if (lpState == LongPressState.ASSIST) lpStopAssist()
+                lpState = LongPressState.NATIVE
+                return false
+            }
+        }
+        return false
+    }
+
+    private fun lpMaybeBegin(event: MotionEvent) {
+        if (event.pointerCount != 1 || dragging) {
+            lpState = LongPressState.NATIVE
+            return
+        }
+        // A long press must have happened, and a selection report must have
+        // arrived since this finger went down. The page makes the real check.
+        if (event.eventTime - lpDownTime < 250L || lastSelectionReportMs <= lpDownTime) return
+        lpState = LongPressState.CHECKING
+        val generation = lpGeneration
+        try {
+            webView.evaluateJavascript(
+                "window.__stLongPressDragBegin ? window.__stLongPressDragBegin() : 'none';"
+            ) { response ->
+                val kind = response?.trim()?.removeSurrounding("\"")
+                val assisted = kind == "chat" || kind == "panel"
+                if (closed || generation != lpGeneration || lpState != LongPressState.CHECKING ||
+                    dragging) {
+                    // The finger lifted (or a handle took over) first.
+                    if (assisted) endLongPressInPage()
+                    if (generation == lpGeneration && lpState == LongPressState.CHECKING) {
+                        lpState = LongPressState.NATIVE
+                    }
+                    return@evaluateJavascript
+                }
+                Log.d(TAG, "Long-press drag check: $response")
+                if (!assisted) {
+                    lpState = LongPressState.NATIVE
+                    return@evaluateJavascript
+                }
+                dragIsChat = kind == "chat"
+                // Chromium extends from (about) the finger itself.
+                fingerOffsetX = 0f
+                fingerOffsetY = 0f
+                resetAcceleration()
+                lpPendingSteps = 0
+                lpScrolled = false
+                lpPendingRelease = null
+                lpJitter = false
+                lpFedX = lpRawX
+                lpFedY = lpRawY
+                lpState = LongPressState.ASSIST
+            }
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "Long-press drag check unavailable", error)
+            lpState = LongPressState.NATIVE
+        }
+    }
+
+    private fun endLongPressInPage() {
+        try {
+            webView.evaluateJavascript(
+                "window.__stLongPressDragEnd && window.__stLongPressDragEnd();", null
+            )
+        } catch (_: RuntimeException) { }
+    }
+
+    private fun lpMove(event: MotionEvent) {
+        if (lpPendingRelease != null) return
+        lpRawX = event.rawX
+        lpRawY = event.rawY
+        val result = clampAndVelocity(lpRawX, lpRawY)
+        lpFedX = result.x
+        lpFedY = result.y
+        if (abs(result.velocity) > 0.01f) {
+            acceleratedVelocity(result.velocity, SystemClock.uptimeMillis())
+            lpStartFrames()
+        } else {
+            lpStopFrames()
+        }
+        forwardToWebView(MotionEvent.ACTION_MOVE, lpFedX, lpFedY, event.eventTime)
+    }
+
+    private fun lpRelease(event: MotionEvent) {
+        lpStopFrames()
+        val release = PendingRelease(event.actionMasked, event.eventTime)
+        if (lpPendingSteps > 0) {
+            // Same rule as handles: Chromium must see the final position
+            // only after the last queued scroll step has been applied.
+            lpPendingRelease = release
+            val generation = lpGeneration
+            webView.postDelayed({
+                if (generation == lpGeneration && lpPendingRelease === release) {
+                    Log.w(TAG, "Long-press scroll acknowledgement timeout")
+                    lpFinish(release)
+                }
+            }, 350L)
+        } else {
+            lpFinish(release)
+        }
+    }
+
+    private fun lpFinish(release: PendingRelease) {
+        if (lpState != LongPressState.ASSIST) return
+        if (release.action == MotionEvent.ACTION_UP && lpScrolled) {
+            val last = clampAndVelocity(lpRawX, lpRawY)
+            lpFedX = last.x
+            lpFedY = last.y
+            forwardToWebView(MotionEvent.ACTION_MOVE, lpFedX, lpFedY, release.eventTime)
+        }
+        forwardToWebView(release.action, lpFedX, lpFedY, release.eventTime)
+        lpEnd()
+    }
+
+    // A new touch began while an UP was still waiting for scroll steps.
+    private fun lpFlushPendingRelease() {
+        val release = lpPendingRelease ?: return
+        lpFinish(release)
+    }
+
+    /** Stops assisting; the rest of the gesture goes to Chromium unchanged. */
+    private fun lpStopAssist() {
+        lpStopFrames()
+        lpEnd()
+    }
+
+    private fun lpCancel() {
+        when (lpState) {
+            LongPressState.ASSIST -> {
+                lpStopFrames()
+                if (webView.isAttachedToWindow) {
+                    forwardToWebView(MotionEvent.ACTION_CANCEL, lpFedX, lpFedY,
+                        SystemClock.uptimeMillis())
+                }
+                lpEnd()
+            }
+            LongPressState.CHECKING -> {
+                lpGeneration++ // a late page answer then ends its own drag state
+                lpState = LongPressState.NATIVE
+            }
+            else -> lpState = LongPressState.NATIVE
+        }
+    }
+
+    private fun lpEnd() {
+        lpState = LongPressState.NATIVE
+        lpPendingRelease = null
+        lpPendingSteps = 0
+        lpScrolled = false
+        lpGeneration++ // ignore late scroll acknowledgements
+        resetAcceleration()
+        endLongPressInPage()
+    }
+
+    private fun forwardToWebView(action: Int, screenX: Float, screenY: Float, whenMs: Long) {
+        webView.getLocationOnScreen(screenLocation)
+        val properties = MotionEvent.PointerProperties().apply {
+            id = lpPointerId
+            toolType = MotionEvent.TOOL_TYPE_FINGER
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            x = screenX
+            y = screenY
+            pressure = 1f
+            size = 1f
+        }
+        // Raw coordinates stay on screen; local ones are made WebView-relative,
+        // exactly as a real dispatched event would be.
+        val event = MotionEvent.obtain(lpDownTime, whenMs, action, 1,
+            arrayOf(properties), arrayOf(coords), 0, 0, 1f, 1f, lpDeviceId, 0, lpSource, 0)
+        event.offsetLocation(-screenLocation[0].toFloat(), -screenLocation[1].toFloat())
+        try {
+            webView.onTouchEvent(event)
+        } finally {
+            event.recycle()
+        }
+    }
+
+    private val lpFrameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!lpRunning || lpState != LongPressState.ASSIST || closed) {
+                lpRunning = false
+                return
+            }
+            if (!pageReady || !webView.isAttachedToWindow) {
+                lpCancel()
+                return
+            }
+            if (lpLastFrameNanos != 0L && frameTimeNanos - lpLastFrameNanos < 15_000_000L) {
+                Choreographer.getInstance().postFrameCallback(this)
+                return
+            }
+            val deltaSeconds = if (lpLastFrameNanos == 0L) 0.016f else
+                ((frameTimeNanos - lpLastFrameNanos) / 1_000_000_000f).coerceIn(0.001f, 0.05f)
+            lpLastFrameNanos = frameTimeNanos
+            val result = clampAndVelocity(lpRawX, lpRawY)
+            lpFedX = result.x
+            lpFedY = result.y
+            if (abs(result.velocity) < 0.01f) {
+                lpStopFrames()
+                return
+            }
+            val delta = acceleratedVelocity(result.velocity, SystemClock.uptimeMillis()) *
+                deltaSeconds
+            if (delta.isFinite()) {
+                val generation = lpGeneration
+                lpPendingSteps++
+                lpScrolled = true
+                try {
+                    webView.evaluateJavascript(
+                        "window.__stAutoScrollStep && window.__stAutoScrollStep($delta,NaN,NaN);"
+                    ) { _ ->
+                        if (generation == lpGeneration) {
+                            lpPendingSteps = (lpPendingSteps - 1).coerceAtLeast(0)
+                            val release = lpPendingRelease
+                            if (lpPendingSteps == 0 && release != null) lpFinish(release)
+                        }
+                    }
+                } catch (error: RuntimeException) {
+                    lpPendingSteps = (lpPendingSteps - 1).coerceAtLeast(0)
+                    Log.w(TAG, "Unable to queue long-press scroll", error)
+                }
+            }
+            // As for handles: a tiny alternating nudge makes Chromium re-hit-test
+            // the moving end against the newly scrolled content.
+            lpJitter = !lpJitter
+            val deltaJitter = if (lpJitter) -sign(result.velocity) * dp(1.1f) else 0f
+            forwardToWebView(MotionEvent.ACTION_MOVE, lpFedX, lpFedY + deltaJitter,
+                SystemClock.uptimeMillis())
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    private fun lpStartFrames() {
+        if (lpRunning) return
+        lpRunning = true
+        lpLastFrameNanos = 0L
+        Choreographer.getInstance().postFrameCallback(lpFrameCallback)
+    }
+
+    private fun lpStopFrames() {
+        resetAcceleration()
+        if (!lpRunning) return
+        lpRunning = false
+        lpLastFrameNanos = 0L
+        Choreographer.getInstance().removeFrameCallback(lpFrameCallback)
+    }
+
     private inner class SelectionBridge {
         @JavascriptInterface
         fun onSelectionStateChanged(
@@ -794,7 +1139,6 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             cssWidth: Float, cssHeight: Float, scrollUp: Boolean, scrollDown: Boolean
         ) {
             if (closed || !pageReady) return
-            hasAnySelection = anySelection
             if (!left.isFinite() || !top.isFinite() || !right.isFinite() ||
                 !bottom.isFinite() || !cssWidth.isFinite() || !cssHeight.isFinite() ||
                 cssWidth <= 0 || cssHeight <= 0 || right <= left || bottom <= top) {
@@ -810,6 +1154,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 regionIsChat = isChat
                 hasRegionSelection = inside
             }
+            if (anySelection) lastSelectionReportMs = SystemClock.uptimeMillis()
             // selectionchange and chat scrolling can each fire dozens of
             // times a second; requestScanBurst() coalesces them.
             if (anySelection) requestScanBurst()

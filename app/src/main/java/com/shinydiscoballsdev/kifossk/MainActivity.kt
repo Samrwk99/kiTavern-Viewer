@@ -596,6 +596,18 @@ class MainActivity : AppCompatActivity() {
                         hiddenPx = Math.max(0, Number(pixels) || 0);
                         viewHeightPx = Math.max(0, Number(height) || 0);
                         schedule();
+                    },
+                    // CSS y of the keyboard's top edge (innerHeight when hidden),
+                    // used to keep selection handles above the keyboard.
+                    visibleBottom: function () {
+                        var pageHeight = window.innerHeight;
+                        if (hiddenPx <= 0 || viewHeightPx <= 0) return pageHeight;
+                        var bottom = pageHeight - hiddenPx * (pageHeight / viewHeightPx);
+                        if (window.visualViewport) {
+                            bottom = Math.min(bottom,
+                                window.visualViewport.offsetTop + window.visualViewport.height);
+                        }
+                        return Math.max(0, bottom - 4);
                     }
                 };
                 document.addEventListener('focusin', schedule, true);
@@ -916,12 +928,15 @@ class MainActivity : AppCompatActivity() {
                     return@setOnTouchListener true
                 }
             }
+            // Long-press-then-drag selection: true only for events the
+            // scroller has already forwarded to WebView with a clamped position.
+            val forwarded = selectionAutoScroller?.onWebViewTouch(event) == true
             if (event.actionMasked == MotionEvent.ACTION_UP ||
                 event.actionMasked == MotionEvent.ACTION_CANCEL) {
                 // Selection handles appear when a long press lifts.
                 selectionAutoScroller?.onWebViewTouchEnded()
             }
-            false // Let WebView/Chromium own native selection, editing and scrolling.
+            forwarded // Otherwise WebView/Chromium owns selection, editing and scrolling.
         }
 
         view.webViewClient = object : WebViewClient() {
