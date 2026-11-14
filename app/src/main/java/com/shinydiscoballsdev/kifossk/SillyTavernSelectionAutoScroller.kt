@@ -9,6 +9,7 @@ import android.view.Choreographer
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.inspector.WindowInspector
 import android.webkit.JavascriptInterface
@@ -816,6 +817,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     @Volatile private var lastSelectionReportMs = 0L
     private var lpState = LongPressState.NATIVE
     private var lpDownTime = 0L
+    private var lpNoReportChecked = false
+    private var lpReportsPoint = false
     private var lpPointerId = 0
     private var lpDeviceId = 0
     private var lpSource = InputDevice.SOURCE_TOUCHSCREEN
@@ -845,6 +848,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 lpState = if (event.pointerCount == 1 && !dragging)
                     LongPressState.IDLE else LongPressState.NATIVE
                 lpDownTime = event.downTime
+                lpNoReportChecked = false
                 lpPointerId = event.getPointerId(0)
                 lpDeviceId = event.deviceId
                 lpSource = event.source
@@ -900,7 +904,14 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         }
         // A long press must have happened, and a selection report must have
         // arrived since this finger went down. The page makes the real check.
-        if (event.eventTime - lpDownTime < 250L || lastSelectionReportMs <= lpDownTime) return
+        // A dropdown's text selection produces no report, so once a full
+        // long-press time has passed the page is asked anyway (once per touch).
+        val elapsed = event.eventTime - lpDownTime
+        if (elapsed < 250L) return
+        val reported = lastSelectionReportMs > lpDownTime
+        if (!reported && (lpNoReportChecked ||
+                elapsed < ViewConfiguration.getLongPressTimeout() + 100L)) return
+        if (!reported) lpNoReportChecked = true
         lpState = LongPressState.CHECKING
         val generation = lpGeneration
         try {
@@ -908,7 +919,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 "window.__stLongPressDragBegin ? window.__stLongPressDragBegin() : 'none';"
             ) { response ->
                 val kind = response?.trim()?.removeSurrounding("\"")
-                val assisted = kind == "chat" || kind == "panel"
+                val assisted = kind == "chat" || kind == "panel" || kind == "dropdown"
                 if (closed || generation != lpGeneration || lpState != LongPressState.CHECKING ||
                     dragging) {
                     // The finger lifted (or a handle took over) first.
@@ -920,10 +931,15 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 }
                 Log.d(TAG, "Long-press drag check: $response")
                 if (!assisted) {
-                    lpState = LongPressState.NATIVE
+                    // Without a report yet, a late one may still bring a real
+                    // long-press selection: keep watching for it.
+                    lpState = if (reported) LongPressState.NATIVE else LongPressState.IDLE
                     return@evaluateJavascript
                 }
                 dragIsChat = kind == "chat"
+                // A drag from a dropdown's text: the page needs the finger
+                // position to know when it leaves the dropdown.
+                lpReportsPoint = kind == "dropdown"
                 // Chromium extends from (about) the finger itself.
                 fingerOffsetX = 0f
                 fingerOffsetY = 0f
@@ -962,6 +978,14 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             lpStartFrames()
         } else {
             lpStopFrames()
+        }
+        if (lpReportsPoint) {
+            try {
+                webView.evaluateJavascript(
+                    "window.__stSelectionAnchorLock && window.__stSelectionAnchorLock.point(" +
+                    "${screenToCssX(lpFedX)},${screenToCssY(lpFedY)});", null
+                )
+            } catch (_: RuntimeException) { }
         }
         forwardToWebView(MotionEvent.ACTION_MOVE, lpFedX, lpFedY, event.eventTime)
     }
@@ -1029,6 +1053,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
 
     private fun lpEnd() {
         lpState = LongPressState.NATIVE
+        lpReportsPoint = false
         lpPendingRelease = null
         lpPendingSteps = 0
         lpScrolled = false
@@ -1093,7 +1118,9 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 lpScrolled = true
                 try {
                     webView.evaluateJavascript(
-                        "window.__stAutoScrollStep && window.__stAutoScrollStep($delta,NaN,NaN);"
+                        if (lpReportsPoint) "window.__stAutoScrollStep && window.__stAutoScrollStep(" +
+                            "$delta,${screenToCssX(lpFedX)},${screenToCssY(lpFedY)});"
+                        else "window.__stAutoScrollStep && window.__stAutoScrollStep($delta,NaN,NaN);"
                     ) { _ ->
                         if (generation == lpGeneration) {
                             lpPendingSteps = (lpPendingSteps - 1).coerceAtLeast(0)

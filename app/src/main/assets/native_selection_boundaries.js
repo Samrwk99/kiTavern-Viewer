@@ -61,6 +61,9 @@
     var longPressActive = false;
     var lastTouchStart = -Infinity;
     var lastSelectionChange = -Infinity;
+    var touchStartX = NaN, touchStartY = NaN, touchMovedEarly = false;
+    // The dropdown whose text a drag started in, until the drag leaves it.
+    var dropdownDrag = null;
 
     function inNode(root, node) {
         return !!(root && node && (node === root || root.contains(node)));
@@ -109,6 +112,61 @@
                 el.selectionStart === el.selectionEnd) return null;
         } catch (_) { return null; }
         return el;
+    }
+    // Dropdowns only. The chosen option's text in a <select> is drawn inside
+    // the control, and a selection of it is not reported to the page as one.
+    // So when no ordinary selection exists, look at what lies at the point
+    // itself (just above a grabbed marker, or where the finger long-pressed)
+    // and treat a <select> there like a text field: clamp and scroll its panel.
+    function dropdownAt(x, y, offsets) {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        var el = document.activeElement;
+        // Insertion handles belong to a focused text field, never a dropdown.
+        if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' || el.isContentEditable)) {
+            return null;
+        }
+        for (var i = 0; i < offsets.length; i++) {
+            var hit = document.elementFromPoint(x, y - offsets[i]);
+            var dropdown = hit && hit.closest ? hit.closest('select') : null;
+            if (dropdown) return dropdown;
+        }
+        return null;
+    }
+    // A selection inside a dropdown can never grow past the dropdown, and
+    // Chromium scrolls it back into view whenever the panel scrolls it away:
+    // the marker then jitters at the edge. So once the drag leaves the
+    // dropdown, or the panel has to scroll, swap it for an ordinary page
+    // selection that starts at the dropdown and runs to the point (keeping the
+    // dropdown inside it). Chromium then extends that like any panel selection.
+    function leaveDropdown(down, x, y) {
+        var dropdown = dropdownDrag;
+        dropdownDrag = null;
+        if (!dropdown || !dropdown.isConnected || !dropdown.parentNode) return;
+        var parent = dropdown.parentNode;
+        var index = Array.prototype.indexOf.call(parent.childNodes, dropdown);
+        var baseOffset = down ? index : index + 1;
+        var extent = null;
+        if (Number.isFinite(x) && Number.isFinite(y) && document.caretRangeFromPoint) {
+            var caret = document.caretRangeFromPoint(x, y);
+            if (caret && inRegion(caret.startContainer) && caret.startContainer !== dropdown &&
+                    !dropdown.contains(caret.startContainer)) {
+                extent = {node: caret.startContainer, offset: caret.startOffset};
+            }
+        }
+        // The far end must lie beyond the dropdown, in the drag direction.
+        if (!extent || (down ? positionCmp(extent.node, extent.offset, parent, index + 1) < 0
+                             : positionCmp(extent.node, extent.offset, parent, index) > 0)) {
+            extent = {node: parent, offset: down ? index + 1 : index};
+        }
+        try {
+            window.getSelection().setBaseAndExtent(parent, baseOffset, extent.node, extent.offset);
+        } catch (_) { }
+    }
+    function trackDropdownPoint(x, y) {
+        if (!dropdownDrag || !Number.isFinite(y)) return;
+        var r = dropdownDrag.getBoundingClientRect();
+        if (y > r.bottom + 4) leaveDropdown(true, x, y);
+        else if (y < r.top - 4) leaveDropdown(false, x, y);
     }
     // The field itself when its text scrolls, else the box that scrolls it.
     function fieldRegion(field) {
@@ -217,6 +275,7 @@
         }
         if (!activeRegion || !Number.isFinite(deltaCssPixels) ||
             Math.abs(deltaCssPixels) > 100) return;
+        if (dropdownDrag && deltaCssPixels) leaveDropdown(deltaCssPixels > 0, pointX, pointY);
         subpixelRemainder += deltaCssPixels;
         var step = Math.trunc(subpixelRemainder);
         if (step) {
@@ -455,6 +514,7 @@
             return node === lockedNode && offset === lockedOffset;
         }
         function stop() {
+            dropdownDrag = null;
             longPressActive = false;
             activeRegion = null;
             activeIsField = false;
@@ -534,7 +594,18 @@
                     setHandleDragging(true);
                     return 'lower:field';
                 }
-                if (!hasPageSelection(sel)) return 'none';
+                if (!hasPageSelection(sel)) {
+                    // The marker tip sits just below the selected text.
+                    var dropdown = dropdownAt(x, y, [3, 8, 14]);
+                    if (!dropdown) return 'none';
+                    var dropdownBox = fieldRegion(dropdown);
+                    if (!dropdownBox) return 'outside';
+                    activeRegion = dropdownBox;
+                    activeIsField = true;
+                    dropdownDrag = dropdown;
+                    setHandleDragging(true);
+                    return 'lower:field';
+                }
                 var r = sel.getRangeAt(0);
                 var forChat = inChat(sel.anchorNode) && inChat(sel.focusNode);
                 var a = endpointRect(r.startContainer, r.startOffset, forChat);
@@ -561,6 +632,7 @@
                 return region === chat ? role : role + ':panel';
             },
             point: function (x, y) {
+                trackDropdownPoint(x, y);
                 if (!role) return;
                 if (Number.isFinite(x)) lastPointX = x;
                 if (Number.isFinite(y)) lastPointY = y;
@@ -575,24 +647,48 @@
     // dragging. Same regions and same scrolling as a handle drag; no DOM
     // endpoint repair (Chromium decides which end moves with the finger).
     window.__stLongPressDragBegin = function () {
-        if (!(lastSelectionChange > lastTouchStart)) return 'stale';
         var s = window.getSelection();
-        if (!hasPageSelection(s)) return 'none';
-        var region = selectionRegion(s);
+        var region = null, isField = false, longPressDropdown = null;
+        if (lastSelectionChange > lastTouchStart && hasPageSelection(s)) {
+            region = selectionRegion(s);
+        } else if (!hasPageSelection(s) && !touchMovedEarly &&
+                performance.now() - lastTouchStart >= 300) {
+            // A genuine long press (no early movement) on a dropdown's text.
+            var dropdown = dropdownAt(touchStartX, touchStartY, [0]);
+            if (!dropdown) return 'none';
+            region = fieldRegion(dropdown);
+            isField = true;
+            longPressDropdown = dropdown;
+        } else {
+            return 'stale';
+        }
         if (!region) return 'outside';
         window.__stSelectionAnchorLock.end();
         activeRegion = region;
-        activeIsField = false;
+        activeIsField = isField;
+        dropdownDrag = longPressDropdown;
         longPressActive = true;
         setHandleDragging(true);
-        return region === chat ? 'chat' : 'panel';
+        if (longPressDropdown) return 'dropdown';
+        return region === chat && !isField ? 'chat' : 'panel';
     };
     // Ends only a long-press drag, never a handle drag begun meanwhile.
     window.__stLongPressDragEnd = function () {
         if (longPressActive) setHandleDragging(false);
     };
-    window.addEventListener('touchstart', function () {
+    window.addEventListener('touchstart', function (e) {
         lastTouchStart = performance.now();
+        var t = e.touches && e.touches[0];
+        touchStartX = t ? t.clientX : NaN;
+        touchStartY = t ? t.clientY : NaN;
+        touchMovedEarly = !!(e.touches && e.touches.length > 1);
+    }, {capture:true, passive:true});
+    // Movement before the long-press time means a scroll, not a long press.
+    window.addEventListener('touchmove', function (e) {
+        if (touchMovedEarly || performance.now() - lastTouchStart > 350) return;
+        var t = e.touches && e.touches[0];
+        if (!t || Math.abs(t.clientX - touchStartX) > 12 ||
+            Math.abs(t.clientY - touchStartY) > 12) touchMovedEarly = true;
     }, {capture:true, passive:true});
 
     // Capture: text fields fire selectionchange/select at the field itself.
@@ -614,5 +710,5 @@
     window.addEventListener('resize', function () { report(true); }, {passive:true});
     window.addEventListener('pageshow', function () { report(true); }, {passive:true});
     report(true);
-    return 'native-popup-handle-bridge-v6';
+    return 'native-popup-handle-bridge-v8';
 })();
