@@ -54,6 +54,13 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         private const val ACCELERATION_INTERVAL_MS = 1_500L
         private const val ACCELERATION_STEP = 0.40f
         private const val MAX_ACCELERATION_FACTOR = 4.0f
+        // Chromium's drag-selection autoscroll, used for text fields and popups:
+        // 20 CSS px edge belt, one step per frame (60 a second), each step as
+        // deep as the point is into the belt. The cap keeps a step within
+        // what the page-side scroll step accepts (100 px).
+        private const val CHROMIUM_BELT_CSS = 20f
+        private const val CHROMIUM_FRAMES_PER_S = 60f
+        private const val CHROMIUM_MAX_STEP_CSS = 90f
         private const val TOP_SAFE_DP = 36f
         private const val BOTTOM_SAFE_DP = 18f
         private const val SIDE_SAFE_DP = 14f
@@ -73,6 +80,9 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     // Speed profile of the drag in progress: #chat (fast, accelerating) or a
     // settings panel / text field (gentle, constant).
     private var dragIsChat = true
+    // Text fields and popup windows: Chromium's own drag-selection scroll
+    // speed (see clampAndVelocity) instead of this class's speed curves.
+    private var dragChromiumSpeed = false
     @Volatile private var rectCss = RectF()
     @Volatile private var viewportWidthCss = 1f
     @Volatile private var viewportHeightCss = 1f
@@ -256,6 +266,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 // (fast, unclamped) handling. Unassisted drags are handed back
                 // unmodified once the page answers, a frame or so later.
                 dragIsChat = regionIsChat
+                dragChromiumSpeed = false
                 gestureGeneration++
                 waitingForAnchorSnapshot = false
                 bufferedDown?.recycle()
@@ -316,6 +327,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                             return@evaluateJavascript
                         }
                         dragIsChat = role.isChat
+                        dragChromiumSpeed = role.chromiumSpeed
                         // The timeout below already delivered DOWN; keep going.
                         if (!waitingForAnchorSnapshot) return@evaluateJavascript
                         waitingForAnchorSnapshot = false
@@ -390,7 +402,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         }
     }
 
-    private class Role(val isChat: Boolean)
+    private class Role(val isChat: Boolean, val chromiumSpeed: Boolean = false)
 
     /**
      * "upper"/"lower" = #chat; "upper:panel"/"lower:panel" = a settings panel;
@@ -401,7 +413,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         if (parts[0] != "upper" && parts[0] != "lower") return null
         return when (parts.getOrNull(1)) {
             null -> Role(isChat = true)
-            "panel", "field" -> Role(isChat = false)
+            "panel", "dropdown" -> Role(isChat = false)
+            "field", "popup" -> Role(isChat = false, chromiumSpeed = true)
             else -> null
         }
     }
@@ -606,7 +619,19 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         val minSpeed = if (dragIsChat) MIN_SPEED_DP_S else PANEL_MIN_SPEED_DP_S
         val maxSpeed = if (dragIsChat) MAX_SPEED_DP_S else PANEL_MAX_SPEED_DP_S
         var v = 0f
-        if (tipY < top + zone && canScrollUp) {
+        if (dragChromiumSpeed) {
+            // Chromium's drag-selection autoscroll (LayoutBox::
+            // CalculateAutoscrollDirection + Autoscroll): a 20 CSS px belt
+            // inside each edge; every frame the box scrolls by how far the
+            // point is into the belt plus any distance past the edge. No
+            // acceleration over time. Speeds here are CSS px per second.
+            val belt = CHROMIUM_BELT_CSS * scaleY
+            if (tipY < top + belt && canScrollUp) {
+                v = -minOf((top + belt - tipY) / scaleY, CHROMIUM_MAX_STEP_CSS) * CHROMIUM_FRAMES_PER_S
+            } else if (tipY > bottom - belt && canScrollDown) {
+                v = minOf((tipY - (bottom - belt)) / scaleY, CHROMIUM_MAX_STEP_CSS) * CHROMIUM_FRAMES_PER_S
+            }
+        } else if (tipY < top + zone && canScrollUp) {
             val t = ((top + zone - tipY) / overshootMax).coerceIn(0f, 1f)
             v = -(minSpeed + (maxSpeed - minSpeed) * t * t)
         } else if (tipY > bottom - zone && canScrollDown) {
@@ -931,7 +956,9 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 "window.__stLongPressDragBegin ? window.__stLongPressDragBegin() : 'none';"
             ) { response ->
                 val kind = response?.trim()?.removeSurrounding("\"")
-                val assisted = kind == "chat" || kind == "panel" || kind == "dropdown"
+                val base = kind?.substringBefore(':')
+                val assisted = base == "chat" || base == "panel" || base == "popup" ||
+                    base == "dropdown"
                 if (closed || generation != lpGeneration || lpState != LongPressState.CHECKING ||
                     dragging) {
                     // The finger lifted (or a handle took over) first.
@@ -948,9 +975,10 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                     lpState = if (reported) LongPressState.NATIVE else LongPressState.IDLE
                     return@evaluateJavascript
                 }
-                dragIsChat = kind == "chat"
+                dragIsChat = base == "chat"
+                dragChromiumSpeed = base == "popup" || kind?.endsWith(":popup") == true
                 // A drag from a dropdown's text: the page drives it (see above).
-                lpPageDriven = kind == "dropdown"
+                lpPageDriven = base == "dropdown"
                 // Chromium extends from (about) the finger itself.
                 fingerOffsetX = 0f
                 fingerOffsetY = 0f
