@@ -475,6 +475,102 @@ class MainActivity : AppCompatActivity() {
                     }
                     return true;
                 }
+                // Popup windows (SillyTavern's <dialog> popups, e.g. the expanded
+                // editor) are centred, so a scroll box inside them cannot simply
+                // be ended at the keyboard. Instead the window itself is limited
+                // to the space above the keyboard and lifted into it; its text
+                // box then gets shorter, like an ordinary keyboard resize.
+                function fitDialog(dialog, usableBottom) {
+                    var dr = dialog.getBoundingClientRect();
+                    if (dr.height <= 0 || dr.bottom <= usableBottom) return;
+                    var topGap = 4;
+                    var available = Math.floor(usableBottom - topGap);
+                    if (available < 80) return;
+                    remember(dialog, ['maxHeight', 'translate']);
+                    if (dr.height > available) {
+                        var cs = getComputedStyle(dialog);
+                        var frame = cs.boxSizing === 'border-box' ? 0 :
+                            (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0) +
+                            (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+                        dialog.style.maxHeight = Math.max(60, available - frame) + 'px';
+                        dr = dialog.getBoundingClientRect();
+                    }
+                    var lift = Math.min(Math.ceil(dr.bottom - usableBottom),
+                        Math.max(0, Math.floor(dr.top - topGap)));
+                    if (lift > 0) dialog.style.translate = '0px ' + (-lift) + 'px';
+                }
+                // Where the caret line is on screen. For a textarea it is
+                // measured with an invisible copy of its text up to the caret.
+                function caretBox(field) {
+                    var fr = field.getBoundingClientRect();
+                    if (field.tagName !== 'TEXTAREA') return {top: fr.top, bottom: fr.bottom};
+                    var end;
+                    try { end = field.selectionEnd; } catch (_) { end = null; }
+                    if (typeof end !== 'number') return null;
+                    var cs = getComputedStyle(field);
+                    var mirror = document.createElement('div');
+                    ['boxSizing', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+                     'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+                     'borderTopStyle', 'borderRightStyle', 'borderBottomStyle', 'borderLeftStyle',
+                     'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'fontVariant',
+                     'letterSpacing', 'lineHeight', 'textTransform', 'wordSpacing', 'textIndent',
+                     'tabSize', 'wordBreak', 'overflowWrap'].forEach(function (prop) {
+                        mirror.style[prop] = cs[prop];
+                    });
+                    mirror.style.position = 'absolute';
+                    mirror.style.visibility = 'hidden';
+                    mirror.style.left = '-10000px';
+                    mirror.style.top = '0';
+                    mirror.style.height = 'auto';
+                    mirror.style.overflow = 'hidden';
+                    mirror.style.whiteSpace = 'pre-wrap';
+                    // The text wraps at the textarea's inner width (without its scrollbar).
+                    mirror.style.boxSizing = 'content-box';
+                    mirror.style.width = Math.max(1, field.clientWidth -
+                        (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0)) + 'px';
+                    mirror.textContent = field.value.slice(0, end);
+                    var marker = document.createElement('span');
+                    marker.textContent = '\u200b';
+                    mirror.appendChild(marker);
+                    document.body.appendChild(mirror);
+                    var top = marker.offsetTop + (parseFloat(cs.borderTopWidth) || 0);
+                    var height = marker.offsetHeight || parseFloat(cs.lineHeight) || 20;
+                    mirror.remove();
+                    return {top: fr.top + top - field.scrollTop,
+                        bottom: fr.top + top + height - field.scrollTop};
+                }
+                // Bring the caret just above the keyboard: by scrolling the box
+                // around the field first (keeps the text where it is), then the
+                // field's own text if that is not enough.
+                function revealCaret(field, scroller, usableBottom) {
+                    var caret = caretBox(field);
+                    if (!caret) return;
+                    var limit = usableBottom - 8;
+                    if (caret.bottom <= limit) return;
+                    if (scroller) {
+                        var room = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
+                        var sr = scroller.getBoundingClientRect();
+                        // Never push the caret above the top of the scroll box.
+                        var step = Math.min(Math.ceil(caret.bottom - limit), room,
+                            Math.max(0, Math.floor(caret.top - sr.top - 8)));
+                        if (step > 0) {
+                            scroller.scrollTop += step;
+                            caret.top -= step;
+                            caret.bottom -= step;
+                        }
+                    }
+                    if (caret.bottom > limit && field.tagName === 'TEXTAREA') {
+                        field.scrollTop += Math.ceil(caret.bottom - limit);
+                    }
+                }
+                function scrollBoxWithin(field, outer) {
+                    for (var el = field.parentElement; el; el = el.parentElement) {
+                        if (el.scrollHeight > el.clientHeight + 1 &&
+                            /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY)) return el;
+                        if (el === outer || el === document.body) break;
+                    }
+                    return null;
+                }
                 function fitFocusedEditor(usableBottom) {
                     var active = document.activeElement;
                     var shell = document.getElementById('sheld');
@@ -485,13 +581,24 @@ class MainActivity : AppCompatActivity() {
                     var key = Math.round(usableBottom) + ':' + innerHeight;
                     if (fittedKey === key && fittedActive === active) return;
                     clearEditorFit();
-                    // The nearest scroll box that runs under the keyboard is
-                    // enough: the caret is kept inside it, so above the keyboard.
-                    for (var el = active.parentElement; el && el !== document.body &&
-                            el !== document.documentElement; el = el.parentElement) {
-                        if (!/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY)) continue;
-                        if (fitInside(active, el, usableBottom)) break;
+                    var scroller = null;
+                    var dialog = active.closest ? active.closest('dialog') : null;
+                    if (dialog && dialog.open) {
+                        fitDialog(dialog, usableBottom);
+                        scroller = scrollBoxWithin(active, dialog);
+                    } else {
+                        // The nearest scroll box that runs under the keyboard is
+                        // enough: the caret is kept inside it, so above the keyboard.
+                        for (var el = active.parentElement; el && el !== document.body &&
+                                el !== document.documentElement; el = el.parentElement) {
+                            if (!/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY)) continue;
+                            if (fitInside(active, el, usableBottom)) {
+                                scroller = el;
+                                break;
+                            }
+                        }
                     }
+                    revealCaret(active, scroller, usableBottom);
                     fittedActive = active;
                     fittedKey = key;
                 }
