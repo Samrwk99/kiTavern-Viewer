@@ -403,6 +403,206 @@ class MainActivity : AppCompatActivity() {
                     if (changedShell) refreshAnchoredMenus();
                 }
 
+                // Fields outside the chat shell (prompt editors, settings,
+                // popups) are not moved by the shell resize below. The WebView
+                // is never resized for the IME, so Chromium believes the area
+                // under the keyboard is visible and, while typing or dragging
+                // a selection handle, scrolls the caret down behind it.
+                // Chromium keeps the caret inside the visible area of each
+                // scroll box, so the scroll box around the focused field is
+                // temporarily ended at the keyboard's top edge. Its contents,
+                // the field included, are pinned at their current size first:
+                // fields that fill a panel (those with an expand icon) must
+                // not be squashed; the panel just becomes scrollable instead.
+                // Everything is restored when the keyboard closes.
+                var fittedEditors = [];
+                var fittedKey = '';
+                var fittedActive = null;
+                function isTextEditor(el) {
+                    if (!el || el.nodeType !== 1) return false;
+                    if (el.tagName === 'TEXTAREA' || el.isContentEditable) return true;
+                    return el.tagName === 'INPUT' &&
+                        /^(text|search|url|email|password|number|tel)?$/i.test(el.type || '');
+                }
+                function remember(el, props) {
+                    var entry = {el: el, values: {}};
+                    for (var i = 0; i < props.length; i++) entry.values[props[i]] = el.style[props[i]];
+                    fittedEditors.push(entry);
+                }
+                function clearEditorFit() {
+                    for (var i = fittedEditors.length - 1; i >= 0; i--) {
+                        var entry = fittedEditors[i];
+                        for (var prop in entry.values) entry.el.style[prop] = entry.values[prop];
+                    }
+                    fittedEditors = [];
+                    fittedKey = '';
+                    fittedActive = null;
+                }
+                function fitInside(active, scroller, usableBottom) {
+                    var sr = scroller.getBoundingClientRect();
+                    var hidden = Math.ceil(sr.bottom - usableBottom);
+                    if (sr.height <= 0 || hidden <= 0 || sr.top >= usableBottom - 48) return false;
+                    // Measure everything before changing anything.
+                    var chain = [];
+                    for (var el = active; el && el !== scroller; el = el.parentElement) {
+                        chain.push({el: el, height: parseFloat(getComputedStyle(el).height)});
+                    }
+                    var scrollerHeight = parseFloat(getComputedStyle(scroller).height);
+                    var fieldHeight = active.getBoundingClientRect().height;
+                    if (!(scrollerHeight > 0)) return false;
+                    for (var i = 0; i < chain.length; i++) {
+                        if (!(chain[i].height > 0)) continue;
+                        remember(chain[i].el, ['minHeight', 'flexShrink']);
+                        chain[i].el.style.minHeight = chain[i].height + 'px';
+                        chain[i].el.style.flexShrink = '0';
+                    }
+                    remember(scroller, ['maxHeight']);
+                    // Computed height follows box-sizing, as max-height does.
+                    scroller.style.maxHeight = Math.max(48, Math.floor(scrollerHeight - hidden)) + 'px';
+                    var after = scroller.getBoundingClientRect();
+                    // A box anchored to the bottom (or centred) does not end
+                    // above the keyboard this way; and the field must keep its size.
+                    if (after.bottom > usableBottom + 1 ||
+                        Math.abs(active.getBoundingClientRect().height - fieldHeight) > 1) {
+                        clearEditorFit();
+                        return false;
+                    }
+                    // If the tapped field is now mostly hidden, bring it up.
+                    var ar = active.getBoundingClientRect();
+                    if (usableBottom - ar.top < Math.min(ar.height, 120)) {
+                        var desiredTop = Math.max(after.top + 8, usableBottom - ar.height - 8);
+                        if (ar.top > desiredTop) scroller.scrollTop += Math.ceil(ar.top - desiredTop);
+                    }
+                    return true;
+                }
+                // Popup windows (SillyTavern's <dialog> popups, e.g. the expanded
+                // editor) are centred, so a scroll box inside them cannot simply
+                // be ended at the keyboard. Instead the window itself is limited
+                // to the space above the keyboard and lifted into it; its text
+                // box then gets shorter, like an ordinary keyboard resize.
+                function fitDialog(dialog, usableBottom) {
+                    var dr = dialog.getBoundingClientRect();
+                    if (dr.height <= 0 || dr.bottom <= usableBottom) return;
+                    var topGap = 4;
+                    var available = Math.floor(usableBottom - topGap);
+                    if (available < 80) return;
+                    remember(dialog, ['maxHeight', 'translate']);
+                    if (dr.height > available) {
+                        var cs = getComputedStyle(dialog);
+                        var frame = cs.boxSizing === 'border-box' ? 0 :
+                            (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0) +
+                            (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
+                        dialog.style.maxHeight = Math.max(60, available - frame) + 'px';
+                        dr = dialog.getBoundingClientRect();
+                    }
+                    var lift = Math.min(Math.ceil(dr.bottom - usableBottom),
+                        Math.max(0, Math.floor(dr.top - topGap)));
+                    if (lift > 0) dialog.style.translate = '0px ' + (-lift) + 'px';
+                }
+                // Where the caret line is on screen. For a textarea it is
+                // measured with an invisible copy of its text up to the caret.
+                function caretBox(field) {
+                    var fr = field.getBoundingClientRect();
+                    if (field.tagName !== 'TEXTAREA') return {top: fr.top, bottom: fr.bottom};
+                    var end;
+                    try { end = field.selectionEnd; } catch (_) { end = null; }
+                    if (typeof end !== 'number') return null;
+                    var cs = getComputedStyle(field);
+                    var mirror = document.createElement('div');
+                    ['boxSizing', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+                     'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+                     'borderTopStyle', 'borderRightStyle', 'borderBottomStyle', 'borderLeftStyle',
+                     'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'fontVariant',
+                     'letterSpacing', 'lineHeight', 'textTransform', 'wordSpacing', 'textIndent',
+                     'tabSize', 'wordBreak', 'overflowWrap'].forEach(function (prop) {
+                        mirror.style[prop] = cs[prop];
+                    });
+                    mirror.style.position = 'absolute';
+                    mirror.style.visibility = 'hidden';
+                    mirror.style.left = '-10000px';
+                    mirror.style.top = '0';
+                    mirror.style.height = 'auto';
+                    mirror.style.overflow = 'hidden';
+                    mirror.style.whiteSpace = 'pre-wrap';
+                    // The text wraps at the textarea's inner width (without its scrollbar).
+                    mirror.style.boxSizing = 'content-box';
+                    mirror.style.width = Math.max(1, field.clientWidth -
+                        (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0)) + 'px';
+                    mirror.textContent = field.value.slice(0, end);
+                    var marker = document.createElement('span');
+                    marker.textContent = '\u200b';
+                    mirror.appendChild(marker);
+                    document.body.appendChild(mirror);
+                    var top = marker.offsetTop + (parseFloat(cs.borderTopWidth) || 0);
+                    var height = marker.offsetHeight || parseFloat(cs.lineHeight) || 20;
+                    mirror.remove();
+                    return {top: fr.top + top - field.scrollTop,
+                        bottom: fr.top + top + height - field.scrollTop};
+                }
+                // Bring the caret just above the keyboard: by scrolling the box
+                // around the field first (keeps the text where it is), then the
+                // field's own text if that is not enough.
+                function revealCaret(field, scroller, usableBottom) {
+                    var caret = caretBox(field);
+                    if (!caret) return;
+                    var limit = usableBottom - 8;
+                    if (caret.bottom <= limit) return;
+                    if (scroller) {
+                        var room = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
+                        var sr = scroller.getBoundingClientRect();
+                        // Never push the caret above the top of the scroll box.
+                        var step = Math.min(Math.ceil(caret.bottom - limit), room,
+                            Math.max(0, Math.floor(caret.top - sr.top - 8)));
+                        if (step > 0) {
+                            scroller.scrollTop += step;
+                            caret.top -= step;
+                            caret.bottom -= step;
+                        }
+                    }
+                    if (caret.bottom > limit && field.tagName === 'TEXTAREA') {
+                        field.scrollTop += Math.ceil(caret.bottom - limit);
+                    }
+                }
+                function scrollBoxWithin(field, outer) {
+                    for (var el = field.parentElement; el; el = el.parentElement) {
+                        if (el.scrollHeight > el.clientHeight + 1 &&
+                            /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY)) return el;
+                        if (el === outer || el === document.body) break;
+                    }
+                    return null;
+                }
+                function fitFocusedEditor(usableBottom) {
+                    var active = document.activeElement;
+                    var shell = document.getElementById('sheld');
+                    if (!isTextEditor(active) || (shell && shell.contains(active))) {
+                        clearEditorFit();
+                        return;
+                    }
+                    var key = Math.round(usableBottom) + ':' + innerHeight;
+                    if (fittedKey === key && fittedActive === active) return;
+                    clearEditorFit();
+                    var scroller = null;
+                    var dialog = active.closest ? active.closest('dialog') : null;
+                    if (dialog && dialog.open) {
+                        fitDialog(dialog, usableBottom);
+                        scroller = scrollBoxWithin(active, dialog);
+                    } else {
+                        // The nearest scroll box that runs under the keyboard is
+                        // enough: the caret is kept inside it, so above the keyboard.
+                        for (var el = active.parentElement; el && el !== document.body &&
+                                el !== document.documentElement; el = el.parentElement) {
+                            if (!/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY)) continue;
+                            if (fitInside(active, el, usableBottom)) {
+                                scroller = el;
+                                break;
+                            }
+                        }
+                    }
+                    revealCaret(active, scroller, usableBottom);
+                    fittedActive = active;
+                    fittedKey = key;
+                }
+
                 function positionComposer() {
                     scheduled = false;
                     var input = document.getElementById('send_textarea');
@@ -413,6 +613,7 @@ class MainActivity : AppCompatActivity() {
                     // hiding the keyboard; resetting at blur makes the popup float.
                     if (!bar || !bar.isConnected || hiddenPx <= 0 ||
                         viewHeightPx <= 0) {
+                        clearEditorFit();
                         reset();
                         return;
                     }
@@ -427,6 +628,7 @@ class MainActivity : AppCompatActivity() {
                             window.visualViewport.offsetTop + window.visualViewport.height);
                     }
                     usableBottom -= 10; // small gap above the keyboard
+                    fitFocusedEditor(usableBottom);
 
                     // SillyTavern's chat and composer are flex children of #sheld.
                     // Shrinking their parent makes BOTH fit above the keyboard,
@@ -501,6 +703,18 @@ class MainActivity : AppCompatActivity() {
                         hiddenPx = Math.max(0, Number(pixels) || 0);
                         viewHeightPx = Math.max(0, Number(height) || 0);
                         schedule();
+                    },
+                    // CSS y of the keyboard's top edge (innerHeight when hidden),
+                    // used to keep selection handles above the keyboard.
+                    visibleBottom: function () {
+                        var pageHeight = window.innerHeight;
+                        if (hiddenPx <= 0 || viewHeightPx <= 0) return pageHeight;
+                        var bottom = pageHeight - hiddenPx * (pageHeight / viewHeightPx);
+                        if (window.visualViewport) {
+                            bottom = Math.min(bottom,
+                                window.visualViewport.offsetTop + window.visualViewport.height);
+                        }
+                        return Math.max(0, bottom - 4);
                     }
                 };
                 document.addEventListener('focusin', schedule, true);
@@ -821,7 +1035,15 @@ class MainActivity : AppCompatActivity() {
                     return@setOnTouchListener true
                 }
             }
-            false // Let WebView/Chromium own native selection, editing and scrolling.
+            // Long-press-then-drag selection: true only for events the
+            // scroller has already forwarded to WebView with a clamped position.
+            val forwarded = selectionAutoScroller?.onWebViewTouch(event) == true
+            if (event.actionMasked == MotionEvent.ACTION_UP ||
+                event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                // Selection handles appear when a long press lifts.
+                selectionAutoScroller?.onWebViewTouchEnded()
+            }
+            forwarded // Otherwise WebView/Chromium owns selection, editing and scrolling.
         }
 
         view.webViewClient = object : WebViewClient() {
