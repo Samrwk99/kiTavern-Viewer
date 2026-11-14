@@ -818,7 +818,13 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
     private var lpState = LongPressState.NATIVE
     private var lpDownTime = 0L
     private var lpNoReportChecked = false
-    private var lpReportsPoint = false
+    // A hold-and-drag from a dropdown's text. Chromium would keep that
+    // selection trapped inside the dropdown, so its moves are not forwarded:
+    // the page sets the selection (dropdown -> finger) itself instead.
+    private var lpPageDriven = false
+    // The last position Chromium itself was given for this touch.
+    private var lpChromiumX = 0f
+    private var lpChromiumY = 0f
     private var lpPointerId = 0
     private var lpDeviceId = 0
     private var lpSource = InputDevice.SOURCE_TOUCHSCREEN
@@ -854,6 +860,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 lpSource = event.source
                 lpRawX = event.rawX
                 lpRawY = event.rawY
+                lpChromiumX = event.rawX
+                lpChromiumY = event.rawY
                 return false
             }
             MotionEvent.ACTION_MOVE -> {
@@ -869,11 +877,15 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                     LongPressState.IDLE -> {
                         lpRawX = event.rawX
                         lpRawY = event.rawY
+                        lpChromiumX = event.rawX
+                        lpChromiumY = event.rawY
                         lpMaybeBegin(event)
                     }
                     LongPressState.CHECKING -> {
                         lpRawX = event.rawX
                         lpRawY = event.rawY
+                        lpChromiumX = event.rawX
+                        lpChromiumY = event.rawY
                     }
                     LongPressState.NATIVE -> { }
                 }
@@ -937,9 +949,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                     return@evaluateJavascript
                 }
                 dragIsChat = kind == "chat"
-                // A drag from a dropdown's text: the page needs the finger
-                // position to know when it leaves the dropdown.
-                lpReportsPoint = kind == "dropdown"
+                // A drag from a dropdown's text: the page drives it (see above).
+                lpPageDriven = kind == "dropdown"
                 // Chromium extends from (about) the finger itself.
                 fingerOffsetX = 0f
                 fingerOffsetY = 0f
@@ -951,6 +962,8 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 lpFedX = lpRawX
                 lpFedY = lpRawY
                 lpState = LongPressState.ASSIST
+                // Take the selection out of the dropdown right away.
+                if (lpPageDriven) lpDriveSelection(clampAndVelocity(lpRawX, lpRawY))
             }
         } catch (error: RuntimeException) {
             Log.w(TAG, "Long-press drag check unavailable", error)
@@ -979,19 +992,34 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
         } else {
             lpStopFrames()
         }
-        if (lpReportsPoint) {
-            try {
-                webView.evaluateJavascript(
-                    "window.__stSelectionAnchorLock && window.__stSelectionAnchorLock.point(" +
-                    "${screenToCssX(lpFedX)},${screenToCssY(lpFedY)});", null
-                )
-            } catch (_: RuntimeException) { }
+        if (lpPageDriven) {
+            lpDriveSelection(result)
+            return
         }
         forwardToWebView(MotionEvent.ACTION_MOVE, lpFedX, lpFedY, event.eventTime)
     }
 
+    private fun lpDriveSelection(feed: Feed) {
+        lpFedX = feed.x
+        lpFedY = feed.y
+        try {
+            webView.evaluateJavascript(
+                "window.__stDropdownDragTo && window.__stDropdownDragTo(" +
+                "${screenToCssX(lpFedX)},${screenToCssY(lpFedY)});", null
+            )
+        } catch (_: RuntimeException) { }
+    }
+
     private fun lpRelease(event: MotionEvent) {
         lpStopFrames()
+        if (lpPageDriven) {
+            // Chromium only gets the end of its touch, where it last saw the
+            // finger: it ends its drag and shows the markers on the page's
+            // selection, without moving it.
+            forwardToWebView(event.actionMasked, lpChromiumX, lpChromiumY, event.eventTime)
+            lpEnd()
+            return
+        }
         val release = PendingRelease(event.actionMasked, event.eventTime)
         if (lpPendingSteps > 0) {
             // Same rule as handles: Chromium must see the final position
@@ -1038,7 +1066,9 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             LongPressState.ASSIST -> {
                 lpStopFrames()
                 if (webView.isAttachedToWindow) {
-                    forwardToWebView(MotionEvent.ACTION_CANCEL, lpFedX, lpFedY,
+                    forwardToWebView(MotionEvent.ACTION_CANCEL,
+                        if (lpPageDriven) lpChromiumX else lpFedX,
+                        if (lpPageDriven) lpChromiumY else lpFedY,
                         SystemClock.uptimeMillis())
                 }
                 lpEnd()
@@ -1053,7 +1083,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
 
     private fun lpEnd() {
         lpState = LongPressState.NATIVE
-        lpReportsPoint = false
+        lpPageDriven = false
         lpPendingRelease = null
         lpPendingSteps = 0
         lpScrolled = false
@@ -1118,7 +1148,7 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
                 lpScrolled = true
                 try {
                     webView.evaluateJavascript(
-                        if (lpReportsPoint) "window.__stAutoScrollStep && window.__stAutoScrollStep(" +
+                        if (lpPageDriven) "window.__stAutoScrollStep && window.__stAutoScrollStep(" +
                             "$delta,${screenToCssX(lpFedX)},${screenToCssY(lpFedY)});"
                         else "window.__stAutoScrollStep && window.__stAutoScrollStep($delta,NaN,NaN);"
                     ) { _ ->
@@ -1135,10 +1165,13 @@ class SillyTavernSelectionAutoScroller(private val webView: WebView) {
             }
             // As for handles: a tiny alternating nudge makes Chromium re-hit-test
             // the moving end against the newly scrolled content.
-            lpJitter = !lpJitter
-            val deltaJitter = if (lpJitter) -sign(result.velocity) * dp(1.1f) else 0f
-            forwardToWebView(MotionEvent.ACTION_MOVE, lpFedX, lpFedY + deltaJitter,
-                SystemClock.uptimeMillis())
+            // Page-driven drags re-place the selection in the scroll step itself.
+            if (!lpPageDriven) {
+                lpJitter = !lpJitter
+                val deltaJitter = if (lpJitter) -sign(result.velocity) * dp(1.1f) else 0f
+                forwardToWebView(MotionEvent.ACTION_MOVE, lpFedX, lpFedY + deltaJitter,
+                    SystemClock.uptimeMillis())
+            }
             Choreographer.getInstance().postFrameCallback(this)
         }
     }

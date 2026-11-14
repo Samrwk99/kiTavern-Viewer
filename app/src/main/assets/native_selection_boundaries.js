@@ -64,6 +64,8 @@
     var touchStartX = NaN, touchStartY = NaN, touchMovedEarly = false;
     // The dropdown whose text a drag started in, until the drag leaves it.
     var dropdownDrag = null;
+    // Hold-and-drag from a dropdown: the page drives the selection itself.
+    var pageDrivenDropdown = null;
 
     function inNode(root, node) {
         return !!(root && node && (node === root || root.contains(node)));
@@ -141,9 +143,18 @@
     function leaveDropdown(down, x, y) {
         var dropdown = dropdownDrag;
         dropdownDrag = null;
+        selectFromDropdown(dropdown, down, x, y);
+    }
+    // down: true = from the dropdown downwards, false = upwards, null = just
+    // the dropdown itself (the finger is still over it).
+    function selectFromDropdown(dropdown, down, x, y) {
         if (!dropdown || !dropdown.isConnected || !dropdown.parentNode) return;
         var parent = dropdown.parentNode;
         var index = Array.prototype.indexOf.call(parent.childNodes, dropdown);
+        if (down === null) {
+            try { window.getSelection().setBaseAndExtent(parent, index, parent, index + 1); } catch (_) { }
+            return;
+        }
         var baseOffset = down ? index : index + 1;
         var extent = null;
         if (Number.isFinite(x) && Number.isFinite(y) && document.caretRangeFromPoint) {
@@ -162,6 +173,14 @@
             window.getSelection().setBaseAndExtent(parent, baseOffset, extent.node, extent.offset);
         } catch (_) { }
     }
+    // Called by the native side for every move of a page-driven drag (and
+    // after each scroll step), with the clamped finger point.
+    window.__stDropdownDragTo = function (x, y) {
+        var dropdown = pageDrivenDropdown;
+        if (!dropdown || !Number.isFinite(x) || !Number.isFinite(y)) return;
+        var r = dropdown.getBoundingClientRect();
+        selectFromDropdown(dropdown, y > r.bottom ? true : (y < r.top ? false : null), x, y);
+    };
     function trackDropdownPoint(x, y) {
         if (!dropdownDrag || !Number.isFinite(y)) return;
         var r = dropdownDrag.getBoundingClientRect();
@@ -281,6 +300,8 @@
         if (step) {
             subpixelRemainder -= step;
             activeRegion.scrollTop += step;
+            // New text has scrolled under the finger: extend to it.
+            if (pageDrivenDropdown) window.__stDropdownDragTo(pointX, pointY);
         }
         report(true);
     };
@@ -515,6 +536,7 @@
         }
         function stop() {
             dropdownDrag = null;
+            pageDrivenDropdown = null;
             longPressActive = false;
             activeRegion = null;
             activeIsField = false;
@@ -666,7 +688,8 @@
         window.__stSelectionAnchorLock.end();
         activeRegion = region;
         activeIsField = isField;
-        dropdownDrag = longPressDropdown;
+        // Hold-and-drag: page-driven from the start (see __stDropdownDragTo).
+        pageDrivenDropdown = longPressDropdown;
         longPressActive = true;
         setHandleDragging(true);
         if (longPressDropdown) return 'dropdown';
@@ -710,5 +733,5 @@
     window.addEventListener('resize', function () { report(true); }, {passive:true});
     window.addEventListener('pageshow', function () { report(true); }, {passive:true});
     report(true);
-    return 'native-popup-handle-bridge-v8';
+    return 'native-popup-handle-bridge-v9';
 })();
