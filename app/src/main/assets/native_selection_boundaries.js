@@ -198,6 +198,11 @@
         }
         return null;
     }
+    // Popup windows (SillyTavern's <dialog> popups): their drags use
+    // Chromium's own drag-selection scroll speed, like text fields.
+    function inPopup(el) {
+        return !!(el && el.closest && el.closest('dialog[open]'));
+    }
     function hasPageSelection(s) {
         return !!(s && s.rangeCount === 1 && !s.isCollapsed);
     }
@@ -626,7 +631,7 @@
                     activeIsField = true;
                     dropdownDrag = dropdown;
                     setHandleDragging(true);
-                    return 'lower:field';
+                    return inPopup(dropdownBox) ? 'lower:popup' : 'lower:panel';
                 }
                 var r = sel.getRangeAt(0);
                 var forChat = inChat(sel.anchorNode) && inChat(sel.focusNode);
@@ -651,7 +656,8 @@
                 lastPointX = x; lastPointY = y - 12; // Caret is above the handle tip.
                 activeRegion = region;
                 setHandleDragging(true);
-                return region === chat ? role : role + ':panel';
+                if (region === chat) return role;
+                return role + (inPopup(region) ? ':popup' : ':panel');
             },
             point: function (x, y) {
                 trackDropdownPoint(x, y);
@@ -692,8 +698,9 @@
         pageDrivenDropdown = longPressDropdown;
         longPressActive = true;
         setHandleDragging(true);
-        if (longPressDropdown) return 'dropdown';
-        return region === chat && !isField ? 'chat' : 'panel';
+        if (longPressDropdown) return inPopup(region) ? 'dropdown:popup' : 'dropdown';
+        if (region === chat && !isField) return 'chat';
+        return inPopup(region) ? 'popup' : 'panel';
     };
     // Ends only a long-press drag, never a handle drag begun meanwhile.
     window.__stLongPressDragEnd = function () {
@@ -733,5 +740,5 @@
     window.addEventListener('resize', function () { report(true); }, {passive:true});
     window.addEventListener('pageshow', function () { report(true); }, {passive:true});
     report(true);
-    return 'native-popup-handle-bridge-v9';
+    return 'native-popup-handle-bridge-v10';
 })();
